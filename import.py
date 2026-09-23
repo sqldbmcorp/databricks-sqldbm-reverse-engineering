@@ -264,6 +264,7 @@ inc_views_w  = widgets.Checkbox(value=True, description="Views (standard + mater
 generate_btn = widgets.Button(description="List Objects", button_style="primary",
                               layout=widgets.Layout(width="220px", margin="10px 130px"))
 source_out   = widgets.Output()
+access_note  = widgets.HTML("")   # read-access check result; shown in Step 1 and Step 2
 
 # ============================================================ STEP 2 controls (object picker)
 filter_w         = widgets.Text(description="Filter", placeholder="name contains… (e.g. fact_, dim_, schema.table)",
@@ -368,6 +369,7 @@ def _load_schemas(cat):
 
 def on_catalog_change(_=None):
     source_out.clear_output()
+    access_note.value = ""
     foreign_note.value = ""
     load_schemas_btn.layout.display = "none"
     schema_sel.options = []
@@ -479,6 +481,7 @@ def _err_line(e):
 def on_list_objects(_):
     global results, catalog, selected_schemas
     source_out.clear_output()
+    access_note.value = ""
     generate_btn.disabled = True
     generate_btn.description = "Listing…"
     with source_out:
@@ -524,6 +527,8 @@ def on_list_objects(_):
                             "ddl": None} for name, kind in objs)
         res.sort(key=lambda r: (r["schema"], r["name"].lower()))
         results = res
+        generate_btn.description = "Checking access…"
+        denied = _check_read_access(res)
         print(f"Found {len(res):,} object(s) across {len(selected_schemas)} schema(s)"
               f"{f' matching {pattern.strip()!r}' if pattern.strip() else ''} in {time.time() - t0:.1f}s. "
               f"{len(skipped)} schema(s) failed. Select objects in Step 2, then generate DDL.")
@@ -543,7 +548,8 @@ def on_list_objects(_):
     filter_w.value = ""
     render_objects()
     update_counts()
-    if results:
+    # Stay on Step 1 if nothing is readable, so the access message is the first thing seen.
+    if results and not (denied and len(denied) == len({r["schema"] for r in results})):
         open_step(1)
 
 def _kind(r):
@@ -762,54 +768,98 @@ _probe_result = {"ok": None, "err": None}
 def _mode(workers):
     return f"{workers}× parallel" if workers else "main thread"
 
-def _failure_details(skipped, workers):
-    """Group DDL failures by reason and show them inline (Step 1's output is collapsed by now)."""
-    if not skipped:
-        return ""
-    groups = {}
-    for k, reason in skipped:
-        groups.setdefault(reason, []).append(k)
-    probe = _probe_result
-    probe_line = ""
-    if probe["ok"] is not None:
-        probe_line = ("<div>Main-thread check on the first object: "
-                      + ("<b>succeeded</b> — so failures are specific to running on worker threads "
-                         "(Parallel 1–16 all use them). Set Parallel to <b>Off (main thread)</b> and "
-                         "generate again." if probe["ok"] and workers else "<b>succeeded</b>." if probe["ok"] else
-                         f"<b>failed</b> too: <code>{html.escape(probe['err'] or '')}</code>") + "</div>")
+_PERMISSION_MARKERS = ("PERMISSION_DENIED", "INSUFFICIENT_PERMISSIONS", "UnauthorizedAccessException")
+
+def _is_permission_error(reason):
+    return any(m in (reason or "") for m in _PERMISSION_MARKERS)
+
+def _technical(items):
+    """Collapsed list of raw errors: [(reason, [example keys])]."""
     rows = "".join(
         f"<li><b>{len(keys):,}×</b> <code style='white-space:pre-wrap'>{html.escape(reason[:600])}</code>"
         f"<div style='color:#777'>e.g. {html.escape(', '.join(keys[:3]))}</div></li>"
-        for reason, keys in sorted(groups.items(), key=lambda kv: -len(kv[1]))[:8])
-    return ("<details open style='margin-top:4px;font-size:12px;color:#444'>"
-            f"<summary style='cursor:pointer'>Failure details ({_mode(workers)})</summary>"
-            f"{_permission_help(skipped)}{probe_line}"
-            f"<ul style='margin:4px 0 0 18px;padding:0'>{rows}</ul></details>")
+        for reason, keys in items[:8])
+    return ("<details style='margin-top:4px'><summary style='cursor:pointer;color:#555'>Technical details"
+            f"</summary><ul style='margin:4px 0 0 18px;padding:0'>{rows}</ul></details>")
 
-_PERMISSION_MARKERS = ("PERMISSION_DENIED", "INSUFFICIENT_PERMISSIONS", "UnauthorizedAccessException")
-
-def _permission_help(skipped):
-    """If failures are Unity Catalog permission errors, show the GRANTs an admin needs to run.
-    Listing only needs BROWSE, but SHOW CREATE TABLE reads the definition, which needs USE CATALOG,
-    USE SCHEMA and SELECT — so a user can list a catalog yet be unable to generate its DDL."""
-    denied = [k for k, reason in skipped if any(m in reason for m in _PERMISSION_MARKERS)]
-    if not denied:
-        return ""
-    schemas = sorted({k.split(".", 1)[0] for k in denied})
+def _access_box(schemas, n_objects, reasons, when):
+    """Plain-language 'you can see it but can't read it' message with the GRANTs to ask for."""
     who = _user or "<user or group>"
     q = lambda x: "`" + x.replace("`", "``") + "`"
     grants = [f"GRANT USE CATALOG ON CATALOG {q(catalog)} TO {q(who)};"]
     for sch in schemas:
         grants.append(f"GRANT USE SCHEMA ON SCHEMA {q(catalog)}.{q(sch)} TO {q(who)};")
         grants.append(f"GRANT SELECT ON SCHEMA {q(catalog)}.{q(sch)} TO {q(who)};")
-    return ("<div style='border:1px solid #e0b252;background:#fff8e6;padding:6px 8px;margin:4px 0;"
-            "max-width:760px'>🔒 <b>Permission denied</b> for "
-            f"{len(denied):,} object(s). You can <i>list</i> this catalog (BROWSE is enough for that), "
-            "but generating DDL with SHOW CREATE TABLE needs <b>USE CATALOG</b>, <b>USE SCHEMA</b> and "
-            "<b>SELECT</b> (or ownership). Ask a catalog owner or admin to run:"
+    where = (f"schema <b>{html.escape(schemas[0])}</b>" if len(schemas) == 1
+             else f"{len(schemas)} schemas ({html.escape(', '.join(schemas[:5]))}{', …' if len(schemas) > 5 else ''})")
+    return ("<div style='border:1px solid #e0b252;background:#fff8e6;padding:8px 10px;margin:6px 0;"
+            "max-width:760px;font-size:13px;line-height:1.45'>"
+            f"🔒 <b>You can see these objects, but you can't read their definitions yet.</b><br>"
+            f"{when} <code>{html.escape(who)}</code> doesn't have read access to {where} in catalog "
+            f"<b>{html.escape(catalog)}</b>, so their DDL can't be generated"
+            f"{f' ({n_objects:,} objects)' if n_objects else ''}. Seeing a catalog's contents only needs "
+            "<i>BROWSE</i>; reading a definition needs <i>USE CATALOG</i>, <i>USE SCHEMA</i> and "
+            "<i>SELECT</i> (or ownership)."
+            "<div style='margin-top:6px'><b>Ask a catalog owner or admin to run:</b></div>"
             "<pre style='margin:4px 0;padding:6px;background:#fff;border:1px solid #ddd;white-space:pre-wrap'>"
             f"{html.escape(chr(10).join(grants))}</pre>"
-            "Granting to a group you belong to works too. Then click Generate again.</div>")
+            "Granting to a group you belong to works too. Afterwards, click <i>List Objects</i> again."
+            f"{_technical(reasons)}</div>")
+
+def _check_read_access(res):
+    """Before Step 2: try SHOW CREATE on one object per schema, so missing privileges surface right
+    after listing instead of after generating DDL for thousands of objects. The DDL is kept.
+    Returns the schemas denied by permissions."""
+    by_schema = {}
+    for r in res:
+        by_schema.setdefault(r["schema"], r)
+    denied, other = {}, {}
+    for schema, r in by_schema.items():
+        try:
+            r["ddl"] = _show_create(r)
+            r["kind"] = _kind_from_ddl(r["ddl"]) or r["kind"]
+        except Exception as e:
+            reason = str(e) if isinstance(e, RuntimeError) else _err_line(e)
+            (denied if _is_permission_error(reason) else other).setdefault(reason, []).append(_key(r))
+    denied_schemas = sorted({k.split(".", 1)[0] for keys in denied.values() for k in keys})
+    notes = []
+    if denied_schemas:
+        n = sum(1 for r in res if r["schema"] in denied_schemas)
+        notes.append(_access_box(denied_schemas, n, list(denied.items()), "Checked before generating DDL:"))
+    if other:
+        notes.append("<div style='color:#a60;font-size:13px;margin:6px 0'>⚠ A test <code>SHOW CREATE TABLE</code> "
+                     f"failed in {sum(len(v) for v in other.values())} schema(s) for a reason other than "
+                     f"permissions; DDL generation may fail there too.{_technical(list(other.items()))}</div>")
+    access_note.value = "".join(notes)
+    return denied_schemas
+
+def _mode(workers):
+    return f"{workers}× parallel" if workers else "main thread"
+
+def _failure_details(skipped, workers):
+    """Explain DDL failures inline: a friendly box for permission errors, raw errors collapsed."""
+    if not skipped:
+        return ""
+    groups = {}
+    for k, reason in skipped:
+        groups.setdefault(reason, []).append(k)
+    ordered = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+    perm = [(r, ks) for r, ks in ordered if _is_permission_error(r)]
+    rest = [(r, ks) for r, ks in ordered if not _is_permission_error(r)]
+    out = ""
+    if perm:
+        schemas = sorted({k.split(".", 1)[0] for _, ks in perm for k in ks})
+        out += _access_box(schemas, sum(len(ks) for _, ks in perm), perm, "DDL generation was refused:")
+    if rest:
+        probe = _probe_result
+        hint = ""
+        if probe["ok"] and workers:
+            hint = ("<div>The first object worked on the main thread, so these failures are specific to "
+                    "worker threads (Parallel 1–16 all use them). Set <b>Parallel</b> to <b>Off</b> and "
+                    "generate again.</div>")
+        out += (f"<div style='font-size:12px;color:#444;margin-top:4px'>{hint}"
+                f"{_technical(rest).replace('<details ', '<details open ', 1)}</div>")
+    return out
 
 def on_preview_continue(_):
     """Step 2 -> Step 3: generate DDL for any newly selected objects, then show the confirmation panel."""
@@ -1190,8 +1240,9 @@ STEP_TITLES = [
 _step1 = widgets.VBox([catalog_dd, catalog_hint, foreign_note, load_schemas_btn,
                        schema_sel, name_filter_w,
                        widgets.HBox([kind_label, inc_tables_w, inc_views_w]),
-                       generate_btn, source_out])
+                       generate_btn, access_note, source_out])
 _step2 = widgets.VBox([
+    access_note,
     widgets.HBox([step2_back_btn, continue_btn, cancel_btn, workers_dd]),
     continue_status,
     widgets.HBox([filter_w, filter_btn]),

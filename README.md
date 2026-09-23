@@ -109,8 +109,9 @@ by a four-step accordion (only one step open at a time):
 - **`ipywidgets`**, available on current DBR and serverless compute.
 - **Unity Catalog / metastore read access** to the schemas you want to import:
   `USE CATALOG`, `USE SCHEMA` and `SELECT` (or ownership). `BROWSE` alone lets you *list*
-  objects but not generate their DDL; if that happens, the notebook shows the `GRANT`
-  statements to ask an admin for.
+  objects but not generate their DDL. Right after *List Objects*, the notebook test-reads one
+  object per schema; if access is missing it says so in plain language and shows the exact
+  `GRANT` statements to ask an admin for, before any DDL generation starts.
 - **Outbound HTTPS** from the cluster to `api.sqldbm.com` and (for the bootstrap)
   `raw.githubusercontent.com`.
 
