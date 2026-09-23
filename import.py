@@ -256,12 +256,10 @@ name_filter_w = widgets.Text(description="Name filter",
                              layout=widgets.Layout(**_W), style=_S)
 kind_label   = widgets.Label("Include", layout=widgets.Layout(width="120px", display="flex",
                                                               justify_content="flex-end"))
-inc_tables_w = widgets.Checkbox(value=True, description="Tables", indent=False,
-                                layout=widgets.Layout(width="90px"))
-inc_views_w  = widgets.Checkbox(value=True, description="Views", indent=False,
-                                layout=widgets.Layout(width="90px"))
-inc_funcs_w  = widgets.Checkbox(value=True, description="Functions", indent=False,
-                                layout=widgets.Layout(width="110px"))
+inc_tables_w = widgets.Checkbox(value=True, description="Tables (managed + external)", indent=False,
+                                layout=widgets.Layout(width="220px"))
+inc_views_w  = widgets.Checkbox(value=True, description="Views (standard + materialized)", indent=False,
+                                layout=widgets.Layout(width="240px"))
 generate_btn = widgets.Button(description="List Objects", button_style="primary",
                               layout=widgets.Layout(width="220px", margin="10px 130px"))
 source_out   = widgets.Output()
@@ -396,7 +394,7 @@ def _kind_from_tabletype(table_type):
 def _kind_from_ddl(ddl):
     """Exact object kind from SHOW CREATE output (e.g. streaming tables list as TABLE until then)."""
     head = " ".join((ddl or "").split()[:6]).upper()
-    for k in ("MATERIALIZED VIEW", "STREAMING TABLE", "VIEW", "FUNCTION", "TABLE"):
+    for k in ("MATERIALIZED VIEW", "STREAMING TABLE", "VIEW", "TABLE"):
         if k in head:
             return k
     return None
@@ -440,33 +438,14 @@ def _list_schema_objects(cat, schema, pattern="", want_tables=True, want_views=T
             out.append((d["tableName"], kind))
     return out
 
-def _list_user_functions(cat, schema, pattern=""):
-    """Return bare function names for user-defined functions in catalog.schema."""
-    like = _like(pattern)
-    try:
-        rows = spark.sql(f"SHOW USER FUNCTIONS IN `{cat}`.`{schema}`{like}").collect()
-        return [row[0].rsplit(".", 1)[-1] for row in rows]
-    except Exception:
-        try:
-            rows = spark.sql(f"SHOW USER FUNCTIONS IN `{schema}`{like}").collect()
-            return [row[0].rsplit(".", 1)[-1] for row in rows]
-        except Exception:
-            return []
-
 def _show_create(r):
-    """Run the appropriate SHOW CREATE statement for the object."""
-    cat, sch, name, kind = r["catalog"], r["schema"], r["name"], r["kind"]
-    if kind == "FUNCTION":
-        try:
-            return spark.sql(f"SHOW CREATE FUNCTION `{cat}`.`{sch}`.`{name}`").first()[0]
-        except Exception:
-            return spark.sql(f"SHOW CREATE FUNCTION `{sch}`.`{name}`").first()[0]
-    else:
-        # Fully qualified: DDL runs on worker threads, so don't rely on the session's current catalog.
-        try:
-            return spark.sql(f"SHOW CREATE TABLE `{cat}`.`{sch}`.`{name}`").first()[0]
-        except Exception:
-            return spark.sql(f"SHOW CREATE TABLE `{sch}`.`{name}`").first()[0]
+    """SHOW CREATE TABLE for a table or view. Fully qualified: DDL runs on worker threads, so don't
+    rely on the session's current catalog."""
+    cat, sch, name = r["catalog"], r["schema"], r["name"]
+    try:
+        return spark.sql(f"SHOW CREATE TABLE `{cat}`.`{sch}`.`{name}`").first()[0]
+    except Exception:
+        return spark.sql(f"SHOW CREATE TABLE `{sch}`.`{name}`").first()[0]
 
 def on_list_objects(_):
     global results, catalog, selected_schemas
@@ -485,10 +464,10 @@ def on_list_objects(_):
             print("Select a catalog and at least one schema, then click List Objects."
                   if catalog else "Select a catalog first.")
             return
-        if not (inc_tables_w.value or inc_views_w.value or inc_funcs_w.value):
+        if not (inc_tables_w.value or inc_views_w.value):
             generate_btn.disabled = False
             generate_btn.description = "List Objects"
-            print("Include at least one object type (Tables, Views or Functions).")
+            print("Include at least one object type (Tables or Views).")
             return
         res, skipped = [], []
         pattern = name_filter_w.value
@@ -513,9 +492,6 @@ def on_list_objects(_):
                     continue
                 res.extend({"catalog": catalog, "schema": schema, "name": name, "kind": kind,
                             "ddl": None} for name, kind in objs)
-            if inc_funcs_w.value:
-                res.extend({"catalog": catalog, "schema": schema, "name": fn, "kind": "FUNCTION",
-                            "ddl": None} for fn in _list_user_functions(catalog, schema, pattern))
         res.sort(key=lambda r: (r["schema"], r["name"].lower()))
         results = res
         print(f"Found {len(res):,} object(s) across {len(selected_schemas)} schema(s)"
@@ -1100,7 +1076,7 @@ STEP_TITLES = [
 ]
 _step1 = widgets.VBox([catalog_dd, catalog_hint, foreign_note, load_schemas_btn,
                        schema_sel, name_filter_w,
-                       widgets.HBox([kind_label, inc_tables_w, inc_views_w, inc_funcs_w]),
+                       widgets.HBox([kind_label, inc_tables_w, inc_views_w]),
                        generate_btn, source_out])
 _step2 = widgets.VBox([
     widgets.HBox([step2_back_btn, continue_btn, cancel_btn, workers_dd]),

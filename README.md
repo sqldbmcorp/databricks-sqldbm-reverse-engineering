@@ -57,8 +57,8 @@ where it matters:
   individual objects before anything is sent.
 - **Pushes via the SqlDBM API.** Creates a project, a revision on the latest, a revision on
   a chosen revision, or routes through a branch for Concurrent-Working projects.
-- **Consistent with the SqlDBM app.** DDL comes from the same `SHOW CREATE TABLE` /
-  `SHOW CREATE FUNCTION` statements SqlDBM's own reverse-engineering tool uses, so the
+- **Consistent with the SqlDBM app.** DDL comes from the same `SHOW CREATE TABLE`
+  statements SqlDBM's own reverse-engineering tool uses, so the
   generated DDL matches what the product would produce. (Object *names* are enumerated with
   `SHOW TABLES` / `SHOW VIEWS` rather than `listTables`, which scales to very large schemas.)
 - **Honest about restricted environments.** A built-in preflight reports compute type,
@@ -74,7 +74,7 @@ by a four-step accordion (only one step open at a time):
 
 1. **Select Catalog and Schema(s)** — choose a catalog, select one or more schemas,
    optionally enter a **Name filter** and choose which object types to include (Tables,
-   Views, Functions), and click *List Objects*. No catalog is selected on load, so nothing
+   Views), and click *List Objects*. No catalog is selected on load, so nothing
    is queried until you pick one. Foreign catalogs are flagged and never queried
    automatically.
 2. **Select Objects and Generate DDL** — discovered objects appear as checkboxes, grouped
@@ -140,7 +140,9 @@ The importer is built to handle schemas with tens of thousands of objects:
 - **Filter before you list.** Step 1's *Name filter* is sent to Databricks as
   `SHOW TABLES … LIKE '<pattern>'`, so only matching names come back. Patterns are
   case-insensitive; `*` matches any characters and `|` separates alternatives — e.g.
-  `fact_*|dim_*` or `*_2024*`. Untick *Views* or *Functions* to skip those types.
+  `fact_*|dim_*` or `*_2024*`. *Tables* covers managed and external tables (external tables keep their `LOCATION` in
+  the generated DDL); *Views* covers standard and materialized views. Untick either to skip
+  that type.
 - **Fast enumeration.** Names come from one `SHOW TABLES` and one `SHOW VIEWS` per schema,
   not per-table metadata lookups. Exact kinds (streaming table, materialized view) are
   confirmed once DDL is generated.
