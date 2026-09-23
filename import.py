@@ -4,7 +4,7 @@ Databricks -> SqlDBM DDL importer  (single-cell interactive app).
 Run from a Databricks notebook cell:
 
     import urllib.request
-    url = "https://raw.githubusercontent.com/sqldbmcorp/poc-databricks-re-notebook/refs/heads/main/import.py"
+    url = "https://raw.githubusercontent.com/sqldbmcorp/databricks-sqldbm-reverse-engineering/refs/heads/main/import.py"
     exec(compile(urllib.request.urlopen(url).read().decode(), "import.py", "exec"), globals())
 
 Renders one form: pick a source catalog + schema(s), list objects, select them, generate DDL, then configure the
@@ -36,8 +36,12 @@ URL_DBTYPE = {"databricks": "Databricks", "snowflake": "Snowflake", "sqlServer":
               "alloyDB": "AlloyDB", "logical": "Logical"}
 # A branch is addressed by its own id in the same p<id> slot as a project.
 BRANCH_URL_TEMPLATE = "https://app.sqldbm.com/{seg}/DatabaseExplorer/p{branch_id}/"
-# Where this script is hosted (used by the preflight reachability check).
-RAW_URL = "https://raw.githubusercontent.com/sqldbmcorp/poc-databricks-re-notebook/refs/heads/main/import.py"
+# Where this script is hosted (used by the preflight reachability check). Prefer the URL the
+# bootstrap cell actually fetched (its `url` global) so the check never drifts from reality.
+DEFAULT_RAW_URL = "https://raw.githubusercontent.com/sqldbmcorp/databricks-sqldbm-reverse-engineering/refs/heads/main/import.py"
+_boot_url = globals().get("url")
+RAW_URL = (_boot_url if isinstance(_boot_url, str) and _boot_url.startswith("https://raw.githubusercontent.com/")
+           else DEFAULT_RAW_URL)
 
 # ============================================================ SqlDBM API client
 def _headers(token):
@@ -155,6 +159,55 @@ _S = {"description_width": "120px"}
 def _list_catalogs():
     return sorted(r[0] for r in spark.sql("SHOW CATALOGS").collect())
 
+def _catalog_types(cats):
+    """name -> {"type", "connection"} from Unity Catalog metadata only — never touches a federated
+    source. Uses the Databricks SDK (one call); falls back to DESCRIBE CATALOG EXTENDED per catalog."""
+    meta = {}
+    try:
+        from databricks.sdk import WorkspaceClient
+        for c in WorkspaceClient().catalogs.list():
+            t = getattr(c.catalog_type, "value", c.catalog_type) or ""
+            meta[c.name] = {"type": str(t).upper(), "connection": c.connection_name}
+    except Exception:
+        pass
+    for cat in cats:
+        if cat in meta:
+            continue
+        info = {"type": "", "connection": None}
+        try:
+            for row in spark.sql(f"DESCRIBE CATALOG EXTENDED `{cat}`").collect():
+                k, v = str(row[0]).strip().lower(), (str(row[1]).strip() if row[1] is not None else "")
+                if k == "catalog type":
+                    info["type"] = v.upper()
+                elif k == "connection name":
+                    info["connection"] = v or None
+        except Exception:
+            pass
+        meta[cat] = info
+    return meta
+
+def _is_foreign(cat):
+    return "FOREIGN" in (_catalog_meta.get(cat, {}).get("type") or "")
+
+def _connection_info(name):
+    """Best-effort {type, host, port} for a UC connection; empty values if not visible to this user."""
+    info = {"type": "", "host": "", "port": ""}
+    if not name:
+        return info
+    try:
+        from databricks.sdk import WorkspaceClient
+        c = WorkspaceClient().connections.get(name)
+        info["type"] = str(getattr(c.connection_type, "value", c.connection_type) or "")
+        opts = c.options or {}
+        info["host"], info["port"] = opts.get("host", ""), opts.get("port", "")
+    except Exception:
+        pass
+    return info
+
+def _short_err(e):
+    """First meaningful part of a Spark/JDBC error — drop the JVM stacktrace."""
+    return str(e).split("JVM stacktrace")[0].strip()
+
 def _list_schemas(cat):
     # Mirrors the tool's DatabricksGetStructure: set current catalog, then listDatabases().
     spark.catalog.setCurrentCatalog(cat)
@@ -162,6 +215,11 @@ def _list_schemas(cat):
 
 catalog_dd   = widgets.Dropdown(description="Catalog", options=[],
                                 layout=widgets.Layout(**_W), style=_S)
+catalog_hint = widgets.HTML("")
+foreign_note = widgets.HTML("")
+load_schemas_btn = widgets.Button(description="Try loading schemas anyway", button_style="warning",
+                                  layout=widgets.Layout(width="240px", margin="4px 130px", display="none"))
+_catalog_meta = {}      # catalog -> {"type", "connection"} (filled at init)
 schema_sel   = widgets.SelectMultiple(description="Schema(s)", options=[], rows=8,
                                       layout=widgets.Layout(**_W), style=_S)
 generate_btn = widgets.Button(description="List Objects", button_style="primary",
@@ -188,17 +246,90 @@ back_btn         = widgets.Button(description="◂  Back", layout=widgets.Layout
 confirm_btn      = widgets.Button(description="Confirm & Configure Destination ▸", button_style="success",
                                   layout=widgets.Layout(width="280px"))
 
-def on_catalog_change(_=None):
+def _foreign_help_html(cat, expanded=False):
+    """Explain why a Lakehouse Federation catalog may be unreachable and how to fix it."""
+    meta = _catalog_meta.get(cat, {})
+    conn = meta.get("connection") or ""
+    ci = _connection_info(conn)
+    esc = html.escape
+    target = f"{ci['host']}:{ci['port']}" if ci["host"] else "the source database host/port"
+    serverless = "connect" in type(spark).__module__
+    port_tip = ""
+    if "SQLSERVER" in ci["type"].upper().replace("_", ""):
+        port_tip = (" For SQL Server the default TCP port is <b>1433</b>; 1434 is normally the SQL Browser / "
+                    "DAC port, so double-check the connection's port.")
+    compute_line = ("<b>This notebook is on serverless compute</b>, which runs in the Databricks-managed "
+                    "network — not your VNet/VPC — so it cannot reach private hosts by default."
+                    if serverless else
+                    "This notebook is on a classic cluster, so the route/firewall from that cluster's "
+                    "VNet/VPC to the source must be open.")
+    conn_bits = [f"connection <code>{esc(conn)}</code>" if conn else "",
+                 f"type {esc(ci['type'])}" if ci["type"] else "",
+                 f"host <code>{esc(target)}</code>" if ci["host"] else ""]
+    conn_desc = ", ".join(b for b in conn_bits if b)
+    return (
+        "<div style='border:1px solid #e0b252;background:#fff8e6;padding:8px 10px;margin:4px 0 6px 128px;"
+        "max-width:720px;font-size:13px;line-height:1.45'>"
+        f"⚠️ <b>{esc(cat)}</b> is a <b>foreign catalog</b> (Lakehouse Federation"
+        f"{' — ' + conn_desc if conn_desc else ''}). "
+        "Its schemas and tables are not stored in Unity Catalog; listing them, listing tables and "
+        "SHOW CREATE TABLE are sent <i>live</i> to the external database from the compute running this "
+        "notebook. Schemas were not loaded automatically because that call can hang or fail if the "
+        "source is unreachable."
+        f"<details{' open' if expanded else ''} style='margin-top:6px'>"
+        "<summary style='cursor:pointer;font-weight:600'>How to reverse-engineer from a foreign catalog</summary>"
+        "<ol style='margin:6px 0 0 18px;padding:0'>"
+        "<li><b>Check the connection itself.</b> Catalog Explorer → External data → Connections → "
+        f"{'<code>' + esc(conn) + '</code>' if conn else 'the connection'} → <i>Test connection</i>. "
+        f"Verify host, port and credentials.{port_tip}</li>"
+        f"<li><b>Give the compute a network path to {esc(target)}.</b> {compute_line}"
+        "<ul style='margin:2px 0 0 16px;padding:0'>"
+        "<li><i>Serverless:</i> an account admin creates a Network Connectivity Configuration (NCC), "
+        "attaches it to this workspace, and either adds a private endpoint rule to the database "
+        "(Azure Private Link / AWS PrivateLink) or allowlists the NCC's stable egress IPs on the "
+        "database firewall.</li>"
+        "<li><i>Classic compute:</i> run this notebook on a Unity Catalog–enabled all-purpose cluster "
+        "(Standard/Shared or Dedicated access mode, DBR 13.3 LTS+) deployed in a VNet/VPC that can "
+        "route to the database, with the database firewall allowing that subnet.</li></ul></li>"
+        "<li><b>Confirm permissions:</b> <code>USE CATALOG</code> on the catalog, <code>USE SCHEMA</code> "
+        "and <code>SELECT</code> on the schemas you want to import.</li>"
+        f"<li><b>Test from a cell:</b> <code>SHOW SCHEMAS IN `{esc(cat)}`</code>. Once that returns, "
+        "click <i>Try loading schemas anyway</i> below.</li>"
+        "<li><b>Or skip Databricks entirely:</b> DDL read through a foreign catalog uses Databricks' "
+        "mapped types, not the source's native DDL. For a native model, create a SqlDBM project with the "
+        "source database type (e.g. SQL Server) and reverse-engineer from that database directly.</li>"
+        "</ol></details></div>")
+
+def _load_schemas(cat):
     schema_sel.options = ["⏳ Loading schemas…"]
     schema_sel.disabled = True
     try:
-        schema_sel.options = _list_schemas(catalog_dd.value)
+        schema_sel.options = _list_schemas(cat)
+        load_schemas_btn.layout.display = "none"
     except Exception as e:
         schema_sel.options = []
+        if _is_foreign(cat):
+            foreign_note.value = _foreign_help_html(cat, expanded=True)
         with source_out:
-            print(f"Could not list schemas for '{catalog_dd.value}': {e}")
+            print(f"Could not list schemas for '{cat}': {_short_err(e)}")
     finally:
         schema_sel.disabled = False
+
+def on_catalog_change(_=None):
+    source_out.clear_output()
+    foreign_note.value = ""
+    load_schemas_btn.layout.display = "none"
+    schema_sel.options = []
+    cat = catalog_dd.value
+    if not cat:
+        return
+    if _is_foreign(cat):
+        # Don't auto-query a federated source: show the guidance and let the user opt in.
+        foreign_note.value = _foreign_help_html(cat)
+        load_schemas_btn.description = "Try loading schemas anyway"
+        load_schemas_btn.layout.display = ""
+        return
+    _load_schemas(cat)
 
 def _kind_from_tabletype(table_type):
     tt = (table_type or "").upper()
@@ -241,13 +372,14 @@ def on_list_objects(_):
     with source_out:
         display(HTML("<div style='font-size:13px;color:#555'>⏳ Listing objects…</div>"))
     catalog = catalog_dd.value
-    selected_schemas = list(schema_sel.value)
+    selected_schemas = [s for s in schema_sel.value if not s.startswith("⏳")]
     source_out.clear_output()
     with source_out:
         if not selected_schemas:
             generate_btn.disabled = False
             generate_btn.description = "List Objects"
-            print("Select at least one schema, then click List Objects.")
+            print("Select a catalog and at least one schema, then click List Objects."
+                  if catalog else "Select a catalog first.")
             return
         res, skipped = [], []
         # Mirrors the tool's DatabricksGetStructure: set current catalog, then
@@ -257,13 +389,13 @@ def on_list_objects(_):
         except Exception as e:
             generate_btn.disabled = False
             generate_btn.description = "List Objects"
-            print(f"Could not set current catalog '{catalog}': {e}")
+            print(f"Could not set current catalog '{catalog}': {_short_err(e)}")
             return
         for schema in selected_schemas:
             try:
                 tbls = spark.catalog.listTables(schema)
             except Exception as e:
-                skipped.append((schema, str(e).splitlines()[0]))
+                skipped.append((schema, _short_err(e).splitlines()[0]))
                 continue
             for t in tbls:
                 if t.isTemporary:
@@ -683,6 +815,7 @@ def _show_links(seg, project_id, branch_id=None, branch_name=None):
 
 # ============================================================ wire up
 catalog_dd.observe(on_catalog_change, names="value")
+load_schemas_btn.on_click(lambda _: _load_schemas(catalog_dd.value) if catalog_dd.value else None)
 generate_btn.on_click(on_list_objects)
 filter_w.observe(render_objects, names="value")
 filter_btn.on_click(lambda _: render_objects())
@@ -701,14 +834,18 @@ for _w in (new_proj_name, update_dd, revision_name_w, diagram_w, strict_w, new_b
     _w.observe(render_review, names="value")
 
 # ============================================================ initialize + render
-catalog_dd.options = _list_catalogs()
-try:
-    _cur = spark.catalog.currentCatalog()
-    if _cur in catalog_dd.options:
-        catalog_dd.value = _cur
-except Exception:
-    pass
-on_catalog_change()
+# Nothing is pre-selected: we don't know how large a catalog is or whether it is reachable
+# (foreign catalogs query their source live), so schemas load only after the user picks one.
+_catalog_names = _list_catalogs()
+_catalog_meta = _catalog_types(_catalog_names)
+catalog_dd.options = [("— select a catalog —", None)] + [
+    (f"{c}   ⚠ foreign (federated)" if _is_foreign(c) else c, c) for c in _catalog_names]
+catalog_dd.value = None
+_n_foreign = sum(1 for c in _catalog_names if _is_foreign(c))
+catalog_hint.value = (
+    "<div style='margin:0 0 4px 128px;font-size:12px;color:#666'>"
+    f"{_n_foreign} catalog(s) marked ⚠ foreign are Lakehouse Federation sources — schemas load "
+    "only on request.</div>") if _n_foreign else ""
 refresh_conditional_fields()
 render_review()
 
@@ -718,7 +855,8 @@ STEP_TITLES = [
     "3 · DDL Confirmation",
     "4 · Configure Destination Project",
 ]
-_step1 = widgets.VBox([catalog_dd, schema_sel, generate_btn, source_out])
+_step1 = widgets.VBox([catalog_dd, catalog_hint, foreign_note, load_schemas_btn,
+                       schema_sel, generate_btn, source_out])
 _step2 = widgets.VBox([
     widgets.HBox([step2_back_btn, continue_btn, continue_status]),
     widgets.HBox([filter_w, filter_btn]),
@@ -790,21 +928,17 @@ def _catalog_info():
     try:
         cats = sorted(r[0] for r in spark.sql("SHOW CATALOGS").collect())
     except Exception as e:
-        return "?", [], False, f"SHOW CATALOGS failed: {str(e).splitlines()[0][:80]}"
-    try:
-        cur = spark.catalog.currentCatalog()
-    except Exception:
-        cur = "?"
+        return [], False, f"SHOW CATALOGS failed: {str(e).splitlines()[0][:80]}"
     uc = ("system" in cats) or ("hive_metastore" in cats) or \
          any(c not in {"spark_catalog", "samples", "hive_metastore"} for c in cats)
     note = "Unity Catalog appears ENABLED" if uc else "No Unity Catalog detected (Hive metastore only)"
-    return cur, cats, uc, note
+    return cats, uc, note
 
 def run_preflight(_=None):
     preflight_out.clear_output()
     with preflight_out:
         dbr, compute = _runtime_info()
-        cur, cats, uc, uc_note = _catalog_info()
+        cats, uc, uc_note = _catalog_info()
         sql_reach, sql_code, _sql_d = _probe(SQLDBM_BASE + "/swagger/v1/swagger.json")
         gh_reach, gh_code, gh_d = _probe(RAW_URL)
 
@@ -843,14 +977,15 @@ def run_preflight(_=None):
                  "all-purpose / job cluster; 'Serverless / Spark Connect' = serverless compute. "
                  "This is NOT the metastore — Hive vs Unity Catalog is the Catalogs / UC row below."),
             line("ok" if uc else "warn", "Catalogs / UC",
-                 f"{uc_note} · current='{cur}' · [{', '.join(cats) if cats else 'none'}]",
-                 "Whether the workspace uses Unity Catalog or is Hive-metastore-only, plus the current "
-                 "catalog and the full SHOW CATALOGS list."),
+                 f"{uc_note} · [{', '.join(cats) if cats else 'none'}]",
+                 "Whether the workspace uses Unity Catalog or is Hive-metastore-only, plus the full "
+                 "SHOW CATALOGS list."),
             line(sql_state, "SqlDBM API (api.sqldbm.com)", sql_text,
                  "GETs the SqlDBM OpenAPI doc (/swagger/v1/swagger.json) and expects HTTP 200, confirming "
                  "this cluster can reach the SqlDBM REST API."),
             line(gh_state, "Script host (raw.githubusercontent.com)", gh_text,
-                 "Whether this cluster can fetch import.py from the GitHub raw URL the bootstrap uses."),
+                 f"Whether this cluster can fetch import.py from the GitHub raw URL the bootstrap uses "
+                 f"({RAW_URL})."),
         ]
         notes = []
         if not uc:
@@ -867,8 +1002,14 @@ def run_preflight(_=None):
             notes.append("GitHub raw unreachable — host import.py inside the workspace (Workspace file "
                          "or Repo) instead of fetching it from GitHub.")
         elif gh_state == "warn":
-            notes.append(f"Reached raw.githubusercontent.com but got HTTP {gh_code} instead of 200 — "
-                         "check the file path / branch in the bootstrap URL.")
+            notes.append(f"Reached raw.githubusercontent.com but got HTTP {gh_code} instead of 200 for "
+                         f"{RAW_URL} — check the file path / branch in the bootstrap URL.")
+        _foreign = [c for c in cats if _is_foreign(c)]
+        if _foreign:
+            notes.append(f"{len(_foreign)} foreign (Lakehouse Federation) catalog(s): {', '.join(_foreign)}. "
+                         "They query the external database live from this compute, so they only work if "
+                         "it has a network path to the source — see the guidance shown in Step 1 when one "
+                         "is selected.")
         notes_html = ("<ul style='margin:6px 0 0 18px;font-size:12px;color:#555'>"
                       + "".join(f"<li>{html.escape(n)}</li>" for n in notes) + "</ul>") if notes else ""
         display(HTML(
