@@ -155,7 +155,13 @@ The importer is built to handle schemas with tens of thousands of objects:
   interrupts in-flight queries. DDL already generated is kept, so clicking *Generate* again
   resumes with the rest. If your compute throttles concurrent metadata queries, set
   *Parallel* to 1.
-- **Step 3 previews the first 200 objects** and reports the full payload size.
+- **Step 3 previews the first 200 objects** and reports the full payload size, raw and
+  gzipped, flagging it if it's over the API limit.
+- **Compressed submit.** The payload is sent gzip-compressed. The SqlDBM API accepts up to
+  15 MB on the wire and 100 MB once decompressed, and DDL compresses well, so in practice
+  the 100 MB uncompressed limit is the one that matters. Oversized payloads are stopped
+  before sending. The import is processed before the API responds, so the client waits
+  up to 15 minutes.
 
 ---
 

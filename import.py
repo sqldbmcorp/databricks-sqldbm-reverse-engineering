@@ -14,7 +14,7 @@ Requirements: ipywidgets (current DBR / serverless), Unity Catalog read access, 
 HTTPS to api.sqldbm.com. `spark` is taken from the calling notebook's globals.
 """
 
-import os, json, time, html, requests, functools, threading
+import os, json, time, html, gzip, requests, functools, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import ipywidgets as widgets
@@ -72,6 +72,31 @@ def list_revisions(token, project_id, branch_id=None):
         data = data.get("revisions", []) or []
     return data or []
 
+# OpenAPI request limits (SqlDbm.OpenAPI RequestSizeConstants): 15 MB on the wire, 100 MB once
+# decompressed; gzip/deflate/br/zstd request bodies are accepted. DDL compresses well, so gzip
+# raises the practical ceiling from 15 MB to 100 MB of DDL.
+MB = 1024 * 1024
+WIRE_LIMIT_BYTES = 15 * MB
+DECOMPRESSED_LIMIT_BYTES = 100 * MB
+# The import is parsed and saved before the API responds, so large payloads take a while.
+SUBMIT_TIMEOUT_S = 900
+
+class PayloadTooLarge(Exception):
+    pass
+
+def _post_json(path, token, body):
+    """POST a gzip-compressed JSON body, checking both API size limits before sending."""
+    raw = json.dumps(body).encode()
+    if len(raw) > DECOMPRESSED_LIMIT_BYTES:
+        raise PayloadTooLarge(f"Request is {len(raw) / MB:.1f} MB uncompressed; the SqlDBM API accepts at "
+                              f"most {DECOMPRESSED_LIMIT_BYTES / MB:.0f} MB. Select fewer objects.")
+    packed = gzip.compress(raw, compresslevel=6)
+    if len(packed) > WIRE_LIMIT_BYTES:
+        raise PayloadTooLarge(f"Request is {len(packed) / MB:.1f} MB compressed; the SqlDBM API accepts at "
+                              f"most {WIRE_LIMIT_BYTES / MB:.0f} MB on the wire. Select fewer objects.")
+    headers = {**_headers(token), "Content-Encoding": "gzip"}
+    return requests.post(f"{SQLDBM_BASE}{path}", headers=headers, data=packed, timeout=SUBMIT_TIMEOUT_S)
+
 def _diagram_block(diagram_name):
     return [{"subjectArea": None, "diagramName": diagram_name}] if diagram_name else None
 
@@ -81,8 +106,7 @@ def create_project(token, project_name, ddl, db_type, revision_name, diagram_nam
     dg = _diagram_block(diagram_name)
     if dg:
         body["addToDiagram"] = dg
-    return requests.post(f"{SQLDBM_BASE}/projects", headers=_headers(token),
-                         data=json.dumps(body), timeout=120)
+    return _post_json("/projects", token, body)
 
 def create_revision(token, project_id, ddl, revision_name, strict=False,
                     branch_id=None, revision_id=None, diagram_name=None):
@@ -92,8 +116,7 @@ def create_revision(token, project_id, ddl, revision_name, strict=False,
     dg = _diagram_block(diagram_name)
     if dg:
         body["addToDiagram"] = dg
-    return requests.post(f"{SQLDBM_BASE}{base}{target}", headers=_headers(token),
-                         data=json.dumps(body), timeout=120)
+    return _post_json(f"{base}{target}", token, body)
 
 def create_branch(token, project_id, branch_name, revision_name="Initial branch revision"):
     return requests.post(f"{SQLDBM_BASE}/projects/{project_id}/branches", headers=_headers(token),
@@ -749,11 +772,18 @@ def _show_preview():
     n = len(chosen)
     shown = chosen[:PREVIEW_OBJECTS]
     preview = "\n".join(f"-- {r['catalog']}.{r['schema']}.{r['name']}\n{r['ddl']};\n" for r in shown)
-    more = (f" Showing the first {len(shown):,}; all {n:,} will be submitted "
-            f"({len(payload.encode()) / 1e6:.1f} MB).") if n > len(shown) else ""
+    raw_n = len(payload.encode())
+    wire_n = len(gzip.compress(payload.encode(), compresslevel=6))
+    more = (f" Showing the first {len(shown):,}; all {n:,} will be submitted." if n > len(shown) else "")
+    size = (f" Payload: {raw_n / MB:.1f} MB ({wire_n / MB:.1f} MB gzipped)."
+            if raw_n > MB else "")
+    if raw_n > DECOMPRESSED_LIMIT_BYTES or wire_n > WIRE_LIMIT_BYTES:
+        size += (f" <b style='color:#c00'>⛔ Over the SqlDBM API limit ({WIRE_LIMIT_BYTES / MB:.0f} MB "
+                 f"compressed / {DECOMPRESSED_LIMIT_BYTES / MB:.0f} MB uncompressed) — deselect some "
+                 "objects before submitting.</b>")
     preview_out.value = (
         f"<div style='font-size:12px;color:#555;margin-bottom:4px'>"
-        f"DDL for <b>{n:,}</b> selected object(s) — review, then confirm.{more}</div>"
+        f"DDL for <b>{n:,}</b> selected object(s) — review, then confirm.{more}{size}</div>"
         "<div style='max-height:480px;overflow:auto;border:1px solid #ccc;padding:8px;"
         "font-family:monospace;white-space:pre;font-size:12px'>"
         f"{html.escape(preview)}</div>")
@@ -970,8 +1000,15 @@ def on_submit(_):
                                   "(couldn't resolve dbType to build a link).")
                 except Exception as e:
                     print(f"(submitted OK; couldn't build link: {e})")
+            elif r.status_code == 413:
+                print(f"❌ 413 — payload too large for the SqlDBM API. Select fewer objects. {r.text}")
             else:
                 print(f"❌ {r.status_code}: {r.text}")
+        except PayloadTooLarge as e:
+            print(f"⛔ {e}")
+        except requests.exceptions.ReadTimeout:
+            print(f"⌛ No response after {SUBMIT_TIMEOUT_S // 60} min. SqlDBM may still be processing the "
+                  "import — check the project's revisions before resubmitting.")
         except Exception as e:
             print(f"Error: {e}")
 
