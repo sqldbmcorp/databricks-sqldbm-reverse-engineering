@@ -142,7 +142,9 @@ The importer is built to handle schemas with tens of thousands of objects:
   case-insensitive; `*` matches any characters and `|` separates alternatives — e.g.
   `fact_*|dim_*` or `*_2024*`. *Tables* covers managed and external tables (external tables keep their `LOCATION` in
   the generated DDL); *Views* covers standard and materialized views. Untick either to skip
-  that type.
+  that type. **Streaming tables are excluded** (SqlDBM doesn't import them yet): they're
+  detected via `information_schema.tables` when listing on Unity Catalog, or from their DDL
+  if that isn't available.
 - **Fast enumeration.** Names come from one `SHOW TABLES` and one `SHOW VIEWS` per schema,
   not per-table metadata lookups. Exact kinds (streaming table, materialized view) are
   confirmed once DDL is generated.

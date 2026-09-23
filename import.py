@@ -172,6 +172,7 @@ selected_schemas = []
 PAGE_SIZES = [100, 250, 500]   # checkbox rows rendered per Step 2 page
 AUTO_SELECT_LIMIT = 500        # listings larger than this start with nothing selected
 DDL_CONFIRM_LIMIT = 1000       # generating DDL for more objects than this asks for a second click
+UNSUPPORTED_KINDS = {"STREAMING TABLE"}   # not yet importable into SqlDBM; excluded
 PREVIEW_OBJECTS = 200          # Step 3 renders DDL for at most this many objects
 DDL_WORKERS = [1, 4, 8, 16]    # parallel SHOW CREATE options (default 8)
 DDL_TAG = "sqldbm-ddl-import"  # Spark Connect operation tag, used to interrupt in-flight queries
@@ -404,22 +405,38 @@ def _like(pattern):
     pattern = (pattern or "").strip()
     return f" LIKE '{pattern.replace(chr(39), chr(39) * 2)}'" if pattern else ""
 
+def _streaming_table_names(cat, schema):
+    """Lower-cased names of streaming tables in a UC schema (SHOW TABLES can't tell them apart).
+    Skipped for Hive (no streaming tables) and foreign catalogs (would query the external source)."""
+    if _is_foreign(cat) or cat.lower() in ("hive_metastore", "spark_catalog"):
+        return set()
+    try:
+        rows = spark.sql(f"SELECT table_name FROM `{cat}`.information_schema.tables "
+                         f"WHERE table_schema = '{schema.replace(chr(39), chr(39) * 2)}' "
+                         "AND table_type = 'STREAMING_TABLE'").collect()
+        return {r[0].lower() for r in rows}
+    except Exception:
+        return set()   # caught after DDL generation instead (see _generate_ddl)
+
 def _list_schema_objects(cat, schema, pattern="", want_tables=True, want_views=True):
-    """[(name, kind)] for one schema via SHOW TABLES + SHOW VIEWS — one metadata call each, with the
-    name filter applied by the server. spark.catalog.listTables() instead loads full metadata per
-    table, which is very slow at tens of thousands of tables (and a remote round trip per table on a
-    foreign catalog). Falls back to listTables() if SHOW TABLES is unsupported."""
+    """([(name, kind)], n_unsupported_excluded) for one schema via SHOW TABLES + SHOW VIEWS — one
+    metadata call each, with the name filter applied by the server. spark.catalog.listTables()
+    instead loads full metadata per table, which is very slow at tens of thousands of tables (and a
+    remote round trip per table on a foreign catalog). Falls back to listTables() if SHOW TABLES is
+    unsupported."""
     ref = f"`{cat}`.`{schema}`"
     try:
         tables = spark.sql(f"SHOW TABLES IN {ref}{_like(pattern)}").collect()
     except Exception:
         spark.catalog.setCurrentCatalog(cat)
-        out = []
+        out, excluded = [], 0
         for t in spark.catalog.listTables(schema):
             kind = _kind_from_tabletype(getattr(t, "tableType", None))
-            if not t.isTemporary and (want_views if "VIEW" in kind else want_tables):
+            if kind in UNSUPPORTED_KINDS:
+                excluded += 1
+            elif not t.isTemporary and (want_views if "VIEW" in kind else want_tables):
                 out.append((t.name, kind))
-        return out
+        return out, excluded
     views = {}
     try:
         for row in spark.sql(f"SHOW VIEWS IN {ref}{_like(pattern)}").collect():
@@ -428,15 +445,19 @@ def _list_schema_objects(cat, schema, pattern="", want_tables=True, want_views=T
                 views[d["viewName"]] = "MATERIALIZED VIEW" if d.get("isMaterialized") else "VIEW"
     except Exception:
         pass   # SHOW VIEWS unsupported here — views list as TABLE until their DDL is generated
-    out = []
+    streaming = _streaming_table_names(cat, schema) if want_tables else set()
+    out, excluded = [], 0
     for row in tables:
         d = row.asDict()
         if d.get("isTemporary"):
             continue
+        if d["tableName"].lower() in streaming:
+            excluded += 1
+            continue
         kind = views.get(d["tableName"], "TABLE")
         if want_views if "VIEW" in kind else want_tables:
             out.append((d["tableName"], kind))
-    return out
+    return out, excluded
 
 def _show_create(r):
     """SHOW CREATE TABLE for a table or view. Fully qualified: DDL runs on worker threads, so don't
@@ -480,13 +501,14 @@ def on_list_objects(_):
             generate_btn.description = "List Objects"
             print(f"Could not set current catalog '{catalog}': {_short_err(e)}")
             return
-        t0 = time.time()
+        t0, n_unsupported = time.time(), 0
         for n, schema in enumerate(selected_schemas, 1):
             generate_btn.description = f"Listing {n}/{len(selected_schemas)}…"
             if inc_tables_w.value or inc_views_w.value:
                 try:
-                    objs = _list_schema_objects(catalog, schema, pattern,
-                                                inc_tables_w.value, inc_views_w.value)
+                    objs, n_excl = _list_schema_objects(catalog, schema, pattern,
+                                                        inc_tables_w.value, inc_views_w.value)
+                    n_unsupported += n_excl
                 except Exception as e:
                     skipped.append((schema, _short_err(e).splitlines()[0]))
                     continue
@@ -497,6 +519,8 @@ def on_list_objects(_):
         print(f"Found {len(res):,} object(s) across {len(selected_schemas)} schema(s)"
               f"{f' matching {pattern.strip()!r}' if pattern.strip() else ''} in {time.time() - t0:.1f}s. "
               f"{len(skipped)} schema(s) failed. Select objects in Step 2, then generate DDL.")
+        if n_unsupported:
+            print(f"Excluded {n_unsupported:,} streaming table(s) — SqlDBM doesn't import them yet.")
         if len(res) > AUTO_SELECT_LIMIT:
             print(f"More than {AUTO_SELECT_LIMIT:,} objects, so nothing is pre-selected — use the Step 2 "
                   "filter and 'Select all matching', or narrow the Name filter here and list again.")
@@ -693,6 +717,13 @@ def _generate_ddl(to_generate, workers):
     except Exception as e:   # never leave the UI stuck in the running state
         skipped.append(("(generator)", _short_err(e)))
     finally:
+        # Fallback for unsupported kinds the listing couldn't detect (e.g. information_schema
+        # unavailable): SHOW CREATE revealed them, so drop them from the object list.
+        dropped = {_key(r) for r in to_generate if r["kind"] in UNSUPPORTED_KINDS}
+        if dropped:
+            results[:] = [r for r in results if _key(r) not in dropped]
+            for k in dropped:
+                selected.pop(k, None)
         _set_running(False)
         render_objects()   # reveal "show DDL" expanders for newly generated objects
         update_counts()
@@ -707,8 +738,12 @@ def _generate_ddl(to_generate, workers):
                                  f"in {elapsed:.0f}s. Generated DDL is kept; click Generate again to "
                                  "resume with the rest.</span>")
         return
-    continue_status.value = (f"<span style='color:#a60'>⚠ {len(skipped):,} object(s) failed DDL generation "
-                             "and will be excluded from the payload.</span>" if skipped else "")
+    notes = []
+    if skipped:
+        notes.append(f"⚠ {len(skipped):,} object(s) failed DDL generation and will be excluded from the payload.")
+    if dropped:
+        notes.append(f"Excluded {len(dropped):,} streaming table(s) — SqlDBM doesn't import them yet.")
+    continue_status.value = (f"<span style='color:#a60'>{' '.join(notes)}</span>" if notes else "")
     _show_preview()
 
 def on_preview_continue(_):
