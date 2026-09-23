@@ -25,8 +25,9 @@ and renders the widgets inline. Then:
 
 1. Check the **Environment preflight** banner at the top — all four rows should be green
    (Compute is informational). Hover any row label for an explanation.
-2. **Step 1 · Select Catalog and Schema(s)** — pick a catalog and schema(s), click
-   *List Objects*.
+2. **Step 1 · Select Catalog and Schema(s)** — pick a catalog (none is pre-selected), then
+   schema(s), and click *List Objects*. Catalogs marked **⚠ foreign** are Lakehouse
+   Federation sources — see [Foreign catalogs](#foreign-lakehouse-federation-catalogs).
 3. **Step 2 · Select Objects and Generate DDL** — review the object list; uncheck anything
    you don't want; click *Generate DDL for Selected*.
 4. **Step 3 · DDL Confirmation** — review the DDL, then click *Confirm & Configure
@@ -71,7 +72,8 @@ When the bootstrap runs, the notebook renders an **Environment preflight** banne
 by a four-step accordion (only one step open at a time):
 
 1. **Select Catalog and Schema(s)** — choose a catalog, select one or more schemas, and
-   click *List Objects*.
+   click *List Objects*. No catalog is selected on load, so nothing is queried until you
+   pick one. Foreign catalogs are flagged and never queried automatically.
 2. **Select Objects and Generate DDL** — every discovered object appears as a checkbox
    (grouped by schema, DDL hidden behind a caret). Filter by name, *Select all* /
    *Deselect all*, then click *Generate DDL for Selected* to build the DDL payload.
@@ -118,9 +120,48 @@ reports:
   Hive-metastore-only, plus the current catalog and the full `SHOW CATALOGS` list.
 - **SqlDBM API** — GETs `https://api.sqldbm.com/swagger/v1/swagger.json` and expects
   HTTP 200, confirming the cluster can reach the SqlDBM REST API.
-- **Script host** — confirms the cluster can fetch `import.py` from GitHub.
+- **Script host** — confirms the cluster can fetch `import.py` from GitHub. It probes the
+  URL your bootstrap cell used (the `url` variable), falling back to this repo's `main`.
+
+It also lists any foreign (Lakehouse Federation) catalogs it finds.
 
 Any non-passing check prints a plain-language note explaining how to remediate it.
+
+---
+
+## Foreign (Lakehouse Federation) catalogs
+
+A **foreign catalog** mirrors an external database (SQL Server, PostgreSQL, Snowflake, …)
+through a Unity Catalog *connection*. Its schemas and tables are **not stored in Unity
+Catalog**: listing schemas, listing tables and `SHOW CREATE TABLE` are all sent *live* to
+the external database **from the compute running the notebook**. If that compute can't
+reach the database, Step 1 fails with a JDBC error such as
+`The TCP/IP connection to the host … has failed`, even though the catalog shows up in
+`SHOW CATALOGS`.
+
+The importer flags these catalogs as **⚠ foreign (federated)** and does not query them
+until you click *Try loading schemas anyway*. To make them work:
+
+1. **Check the connection.** Catalog Explorer → External data → Connections → *your
+   connection* → **Test connection**. Verify host, port and credentials (SQL Server's default
+   TCP port is 1433; 1434 is normally the SQL Browser / DAC port).
+2. **Give the compute a network path to the database.**
+   - *Serverless compute* runs in the Databricks-managed network, not your VNet/VPC. An
+     account admin creates a **Network Connectivity Configuration (NCC)**, attaches it to the
+     workspace, and either adds a **private endpoint rule** to the database (Azure Private
+     Link / AWS PrivateLink) or allowlists the NCC's **stable egress IPs** on the database
+     firewall.
+   - *Classic compute:* run the notebook on a Unity Catalog–enabled all-purpose cluster
+     (Standard/Shared or Dedicated access mode, DBR 13.3 LTS+) deployed in a VNet/VPC that
+     can route to the database, with the database firewall allowing that subnet.
+3. **Confirm permissions:** `USE CATALOG` on the catalog, `USE SCHEMA` and `SELECT` on the
+   schemas you import.
+4. **Test from a cell:** ``SHOW SCHEMAS IN `<catalog>` `` — once it returns, load the schemas in
+   Step 1.
+5. **Or reverse-engineer the source directly.** DDL read through a foreign catalog uses
+   Databricks' mapped types, not the source's native DDL. For a native model, create a SqlDBM
+   project with the source database type (e.g. SQL Server) and reverse-engineer from that
+   database directly.
 
 ---
 
