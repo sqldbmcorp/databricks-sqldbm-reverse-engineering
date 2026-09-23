@@ -26,7 +26,7 @@ and renders the widgets inline. Then:
 1. Check the **Environment preflight** banner at the top — all four rows should be green
    (Compute is informational). Hover any row label for an explanation.
 2. **Step 1 · Select Catalog and Schema(s)** — pick a catalog (none is pre-selected), then
-   schema(s), and click *List Objects*. Catalogs marked **⚠ foreign** are Lakehouse
+   schema(s), optionally a *Name filter* and object types, and click *List Objects*. Catalogs marked **⚠ foreign** are Lakehouse
    Federation sources — see [Foreign catalogs](#foreign-lakehouse-federation-catalogs).
 3. **Step 2 · Select Objects and Generate DDL** — review the object list; uncheck anything
    you don't want; click *Generate DDL for Selected*.
@@ -57,9 +57,10 @@ where it matters:
   individual objects before anything is sent.
 - **Pushes via the SqlDBM API.** Creates a project, a revision on the latest, a revision on
   a chosen revision, or routes through a branch for Concurrent-Working projects.
-- **Consistent with the SqlDBM app.** Extraction uses the same Spark primitives
-  (`setCurrentCatalog` → `listTables` → `SHOW CREATE TABLE`) as SqlDBM's own
-  reverse-engineering tool, so the generated DDL matches what the product would produce.
+- **Consistent with the SqlDBM app.** DDL comes from the same `SHOW CREATE TABLE`
+  statements SqlDBM's own reverse-engineering tool uses, so the
+  generated DDL matches what the product would produce. (Object *names* are enumerated with
+  `SHOW TABLES` / `SHOW VIEWS` rather than `listTables`, which scales to very large schemas.)
 - **Honest about restricted environments.** A built-in preflight reports compute type,
   Unity Catalog vs Hive metastore, and endpoint reachability, so users on locked-down or
   government clouds see what will and won't work before they start.
@@ -71,12 +72,15 @@ where it matters:
 When the bootstrap runs, the notebook renders an **Environment preflight** banner followed
 by a four-step accordion (only one step open at a time):
 
-1. **Select Catalog and Schema(s)** — choose a catalog, select one or more schemas, and
-   click *List Objects*. No catalog is selected on load, so nothing is queried until you
-   pick one. Foreign catalogs are flagged and never queried automatically.
-2. **Select Objects and Generate DDL** — every discovered object appears as a checkbox
-   (grouped by schema, DDL hidden behind a caret). Filter by name, *Select all* /
-   *Deselect all*, then click *Generate DDL for Selected* to build the DDL payload.
+1. **Select Catalog and Schema(s)** — choose a catalog, select one or more schemas,
+   optionally enter a **Name filter** and choose which object types to include (Tables,
+   Views), and click *List Objects*. No catalog is selected on load, so nothing
+   is queried until you pick one. Foreign catalogs are flagged and never queried
+   automatically.
+2. **Select Objects and Generate DDL** — discovered objects appear as checkboxes, grouped
+   by schema and **paginated** (100 / 250 / 500 per page). Filter by name, *Select all
+   matching* / *Deselect all matching* / *Select this page*, then click *Generate DDL for
+   Selected* to build the DDL payload.
 3. **DDL Confirmation** — review the exact DDL that will be sent, then click
    *Confirm & Configure Destination*.
 4. **Configure Destination Project** — enter your SqlDBM API token, click
@@ -103,7 +107,11 @@ by a four-step accordion (only one step open at a time):
   `spark.catalog.setCurrentCatalog`, `listTables`, and `listDatabases`, which require
   Spark 3.4+. (This is the same baseline SqlDBM's own tool requires.)
 - **`ipywidgets`**, available on current DBR and serverless compute.
-- **Unity Catalog / metastore read access** to the schemas you want to import.
+- **Unity Catalog / metastore read access** to the schemas you want to import:
+  `USE CATALOG`, `USE SCHEMA` and `SELECT` (or ownership). `BROWSE` alone lets you *list*
+  objects but not generate their DDL. Right after *List Objects*, the notebook test-reads one
+  object per schema; if access is missing it says so in plain language and shows the exact
+  `GRANT` statements to ask an admin for, before any DDL generation starts.
 - **Outbound HTTPS** from the cluster to `api.sqldbm.com` and (for the bootstrap)
   `raw.githubusercontent.com`.
 
@@ -126,6 +134,44 @@ reports:
 It also lists any foreign (Lakehouse Federation) catalogs it finds.
 
 Any non-passing check prints a plain-language note explaining how to remediate it.
+
+---
+
+## Large schemas
+
+The importer is built to handle schemas with tens of thousands of objects:
+
+- **Filter before you list.** Step 1's *Name filter* is sent to Databricks as
+  `SHOW TABLES … LIKE '<pattern>'`, so only matching names come back. Patterns are
+  case-insensitive; `*` matches any characters and `|` separates alternatives — e.g.
+  `fact_*|dim_*` or `*_2024*`. *Tables* covers managed and external tables (external tables keep their `LOCATION` in
+  the generated DDL); *Views* covers standard and materialized views. Untick either to skip
+  that type. **Streaming tables are excluded** (SqlDBM doesn't import them yet): they're
+  detected via `information_schema.tables` when listing on Unity Catalog, or from their DDL
+  if that isn't available.
+- **Fast enumeration.** Names come from one `SHOW TABLES` and one `SHOW VIEWS` per schema,
+  not per-table metadata lookups. Exact kinds (streaming table, materialized view) are
+  confirmed once DDL is generated.
+- **Paginated selection.** Step 2 renders one page at a time; selection is tracked
+  separately, so *Select all matching* covers every match, not just the visible page.
+- **Nothing pre-selected above 500 objects**, so a large listing can't accidentally turn
+  into tens of thousands of `SHOW CREATE` calls. Generating DDL for more than 1,000 objects
+  asks for a second click and shows progress with an estimated time remaining.
+- **Optional parallel, cancellable DDL generation.** By default `SHOW CREATE` runs one
+  object at a time on the notebook's main thread. Setting *Parallel* to 1 / 4 / 8 / 16 runs
+  it on background worker threads instead, which keeps the notebook responsive and enables
+  **Cancel**. Cancel stops queued work and, on serverless / Spark Connect, interrupts
+  in-flight queries. DDL already generated is kept, so *Generate* again resumes. Some
+  compute doesn't allow Spark calls from worker threads; if DDL generation fails, the
+  inline *Failure details* say whether that's the cause. Leave *Parallel* on *Off* in that
+  case.
+- **Step 3 previews the first 200 objects** and reports the full payload size, raw and
+  gzipped, flagging it if it's over the API limit.
+- **Compressed submit.** The payload is sent gzip-compressed. The SqlDBM API accepts up to
+  15 MB on the wire and 100 MB once decompressed, and DDL compresses well, so in practice
+  the 100 MB uncompressed limit is the one that matters. Oversized payloads are stopped
+  before sending. The import is processed before the API responds, so the client waits
+  up to 15 minutes.
 
 ---
 
