@@ -153,12 +153,14 @@ The importer is built to handle schemas with tens of thousands of objects:
 - **Nothing pre-selected above 500 objects**, so a large listing can't accidentally turn
   into tens of thousands of `SHOW CREATE` calls. Generating DDL for more than 1,000 objects
   asks for a second click and shows progress with an estimated time remaining.
-- **Parallel, cancellable DDL generation.** `SHOW CREATE` runs on a pool of worker threads
-  (*Parallel*: 1 / 4 / 8 / 16, default 8) in the background, so the notebook stays
-  responsive. **Cancel** stops queued work immediately and, on serverless / Spark Connect,
-  interrupts in-flight queries. DDL already generated is kept, so clicking *Generate* again
-  resumes with the rest. If your compute throttles concurrent metadata queries, set
-  *Parallel* to 1.
+- **Optional parallel, cancellable DDL generation.** By default `SHOW CREATE` runs one
+  object at a time on the notebook's main thread. Setting *Parallel* to 1 / 4 / 8 / 16 runs
+  it on background worker threads instead, which keeps the notebook responsive and enables
+  **Cancel**. Cancel stops queued work and, on serverless / Spark Connect, interrupts
+  in-flight queries. DDL already generated is kept, so *Generate* again resumes. Some
+  compute doesn't allow Spark calls from worker threads; if DDL generation fails, the
+  inline *Failure details* say whether that's the cause. Leave *Parallel* on *Off* in that
+  case.
 - **Step 3 previews the first 200 objects** and reports the full payload size, raw and
   gzipped, flagging it if it's over the API limit.
 - **Compressed submit.** The payload is sent gzip-compressed. The SqlDBM API accepts up to

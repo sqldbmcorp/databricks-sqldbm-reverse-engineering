@@ -174,7 +174,7 @@ AUTO_SELECT_LIMIT = 500        # listings larger than this start with nothing se
 DDL_CONFIRM_LIMIT = 1000       # generating DDL for more objects than this asks for a second click
 UNSUPPORTED_KINDS = {"STREAMING TABLE"}   # not yet importable into SqlDBM; excluded
 PREVIEW_OBJECTS = 200          # Step 3 renders DDL for at most this many objects
-DDL_WORKERS = [1, 4, 8, 16]    # parallel SHOW CREATE options (default 8)
+DDL_WORKERS = [("Off (main thread, no Cancel)", 0), ("1", 1), ("4", 4), ("8", 8), ("16", 16)]
 DDL_TAG = "sqldbm-ddl-import"  # Spark Connect operation tag, used to interrupt in-flight queries
 
 NEW_PROJECT = "➕  Create new project"
@@ -288,7 +288,7 @@ continue_btn     = widgets.Button(description="Generate DDL for Selected ▸", b
 continue_status  = widgets.HTML("")
 cancel_btn       = widgets.Button(description="Cancel", button_style="danger", icon="stop",
                                   layout=widgets.Layout(width="100px", display="none"))
-workers_dd       = widgets.Dropdown(options=DDL_WORKERS, value=8, description="Parallel",
+workers_dd       = widgets.Dropdown(options=DDL_WORKERS, value=0, description="Parallel",
                                     tooltip="How many SHOW CREATE statements run at once",
                                     layout=widgets.Layout(width="200px"), style=_S)
 # ---- Step 3 (DDL confirmation) ----
@@ -465,8 +465,16 @@ def _show_create(r):
     cat, sch, name = r["catalog"], r["schema"], r["name"]
     try:
         return spark.sql(f"SHOW CREATE TABLE `{cat}`.`{sch}`.`{name}`").first()[0]
-    except Exception:
-        return spark.sql(f"SHOW CREATE TABLE `{sch}`.`{name}`").first()[0]
+    except Exception as e1:
+        try:
+            return spark.sql(f"SHOW CREATE TABLE `{sch}`.`{name}`").first()[0]
+        except Exception as e2:
+            raise RuntimeError(f"{_err_line(e1)}  |  unqualified retry: {_err_line(e2)}") from e2
+
+def _err_line(e):
+    """One-line, type-prefixed summary of an exception (Spark errors can start with blank lines)."""
+    lines = [l.strip() for l in _short_err(e).splitlines() if l.strip()]
+    return f"{type(e).__name__}: {lines[0] if lines else '(no message)'}"
 
 def on_list_objects(_):
     global results, catalog, selected_schemas
@@ -686,18 +694,22 @@ def _generate_ddl(to_generate, workers):
     total, done, skipped, t0, last = len(to_generate), 0, [], time.time(), 0.0
 
     def one(r):
+        if r["ddl"] is not None:   # e.g. the main-thread check already generated it
+            return r, r["ddl"], None
         if cancel.is_set():
             return r, None, "cancelled"
         try:
             return r, _show_create(r), None
         except Exception as e:
-            return r, None, _short_err(e).splitlines()[0] if str(e) else type(e).__name__
+            return r, None, (str(e) if isinstance(e, RuntimeError) else _err_line(e))
 
     try:
-        pool = ThreadPoolExecutor(max_workers=workers, initializer=_tag_worker)
-        futures = [pool.submit(one, r) for r in to_generate]
-        for f in as_completed(futures):
-            r, ddl, err = f.result()
+        if workers:
+            pool = ThreadPoolExecutor(max_workers=workers, initializer=_tag_worker)
+            outcomes = (f.result() for f in as_completed([pool.submit(one, r) for r in to_generate]))
+        else:   # "Off": sequential on the calling (main) thread
+            pool, outcomes = None, (one(r) for r in to_generate)
+        for r, ddl, err in outcomes:
             done += 1
             if ddl is not None:
                 r["ddl"] = ddl
@@ -711,9 +723,10 @@ def _generate_ddl(to_generate, workers):
                 last = now
                 eta = (now - t0) / done * (total - done)
                 continue_status.value = (f"<span style='color:#555'>⏳ Generating DDL… {done:,}/{total:,} "
-                                         f"({workers}× parallel){f' · ~{eta / 60:.0f} min left' if eta > 90 else ''}"
+                                         f"({_mode(workers)}){f' · ~{eta / 60:.0f} min left' if eta > 90 else ''}"
                                          "</span>")
-        pool.shutdown(wait=True, cancel_futures=True)
+        if pool:
+            pool.shutdown(wait=True, cancel_futures=True)
     except Exception as e:   # never leave the UI stuck in the running state
         skipped.append(("(generator)", _short_err(e)))
     finally:
@@ -729,9 +742,6 @@ def _generate_ddl(to_generate, workers):
         update_counts()
 
     elapsed = time.time() - t0
-    if skipped:
-        source_out.append_stdout("".join(f"  - DDL generation failed for {k}: {reason[:120]}\n"
-                                         for k, reason in skipped[:25]))
     if cancel.is_set():
         got = sum(1 for r in to_generate if r["ddl"] is not None)
         continue_status.value = (f"<span style='color:#a60'>⏹ Cancelled — generated {got:,} of {total:,} "
@@ -743,8 +753,37 @@ def _generate_ddl(to_generate, workers):
         notes.append(f"⚠ {len(skipped):,} object(s) failed DDL generation and will be excluded from the payload.")
     if dropped:
         notes.append(f"Excluded {len(dropped):,} streaming table(s) — SqlDBM doesn't import them yet.")
-    continue_status.value = (f"<span style='color:#a60'>{' '.join(notes)}</span>" if notes else "")
+    continue_status.value = (f"<span style='color:#a60'>{' '.join(notes)}</span>" if notes else "") \
+        + _failure_details(skipped, workers)
     _show_preview()
+
+_probe_result = {"ok": None, "err": None}
+
+def _mode(workers):
+    return f"{workers}× parallel" if workers else "main thread"
+
+def _failure_details(skipped, workers):
+    """Group DDL failures by reason and show them inline (Step 1's output is collapsed by now)."""
+    if not skipped:
+        return ""
+    groups = {}
+    for k, reason in skipped:
+        groups.setdefault(reason, []).append(k)
+    probe = _probe_result
+    probe_line = ""
+    if probe["ok"] is not None:
+        probe_line = ("<div>Main-thread check on the first object: "
+                      + ("<b>succeeded</b> — so failures are specific to running on worker threads "
+                         "(Parallel 1–16 all use them). Set Parallel to <b>Off (main thread)</b> and "
+                         "generate again." if probe["ok"] and workers else "<b>succeeded</b>." if probe["ok"] else
+                         f"<b>failed</b> too: <code>{html.escape(probe['err'] or '')}</code>") + "</div>")
+    rows = "".join(
+        f"<li><b>{len(keys):,}×</b> <code style='white-space:pre-wrap'>{html.escape(reason[:600])}</code>"
+        f"<div style='color:#777'>e.g. {html.escape(', '.join(keys[:3]))}</div></li>"
+        for reason, keys in sorted(groups.items(), key=lambda kv: -len(kv[1]))[:8])
+    return ("<details open style='margin-top:4px;font-size:12px;color:#444'>"
+            f"<summary style='cursor:pointer'>Failure details ({_mode(workers)})</summary>"
+            f"{probe_line}<ul style='margin:4px 0 0 18px;padding:0'>{rows}</ul></details>")
 
 def on_preview_continue(_):
     """Step 2 -> Step 3: generate DDL for any newly selected objects, then show the confirmation panel."""
@@ -758,7 +797,7 @@ def on_preview_continue(_):
     if len(to_generate) > DDL_CONFIRM_LIMIT and _ddl_confirm["n"] != len(to_generate):
         _ddl_confirm["n"] = len(to_generate)
         continue_status.value = (f"<span style='color:#a60'>⚠ This runs SHOW CREATE for "
-                                 f"<b>{len(to_generate):,}</b> objects ({workers_dd.value}× parallel) and can "
+                                 f"<b>{len(to_generate):,}</b> objects ({_mode(workers_dd.value)}) and can "
                                  "take a while. Click again to proceed (you can cancel), or narrow the "
                                  "selection.</span>")
         return
@@ -766,9 +805,22 @@ def on_preview_continue(_):
     if not to_generate:
         _show_preview()
         return
+    # Run the first object on the main thread: it separates "SHOW CREATE fails here" from
+    # "SHOW CREATE fails only on worker threads" when diagnosing failures.
+    first = to_generate[0]
+    try:
+        first["ddl"] = _show_create(first)
+        first["kind"] = _kind_from_ddl(first["ddl"]) or first["kind"]
+        _probe_result.update(ok=True, err=None)
+    except Exception as e:
+        _probe_result.update(ok=False, err=str(e) if isinstance(e, RuntimeError) else _err_line(e))
     _ddl_run["cancel"].clear()
     _set_running(True)
     continue_status.value = "<span style='color:#555'>⏳ Generating DDL…</span>"
+    if not workers_dd.value:
+        cancel_btn.layout.display = "none"   # the kernel is busy, so a click couldn't arrive anyway
+        _generate_ddl(to_generate, 0)
+        return
     t = threading.Thread(target=_generate_ddl, args=(to_generate, workers_dd.value), daemon=True)
     _ddl_run["thread"] = t
     t.start()
