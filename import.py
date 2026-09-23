@@ -14,7 +14,8 @@ Requirements: ipywidgets (current DBR / serverless), Unity Catalog read access, 
 HTTPS to api.sqldbm.com. `spark` is taken from the calling notebook's globals.
 """
 
-import os, json, time, html, requests, functools
+import os, json, time, html, requests, functools, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import ipywidgets as widgets
 from IPython.display import display, HTML
@@ -149,6 +150,8 @@ PAGE_SIZES = [100, 250, 500]   # checkbox rows rendered per Step 2 page
 AUTO_SELECT_LIMIT = 500        # listings larger than this start with nothing selected
 DDL_CONFIRM_LIMIT = 1000       # generating DDL for more objects than this asks for a second click
 PREVIEW_OBJECTS = 200          # Step 3 renders DDL for at most this many objects
+DDL_WORKERS = [1, 4, 8, 16]    # parallel SHOW CREATE options (default 8)
+DDL_TAG = "sqldbm-ddl-import"  # Spark Connect operation tag, used to interrupt in-flight queries
 
 NEW_PROJECT = "➕  Create new project"
 NEW_BRANCH = "➕  Create new branch"
@@ -261,8 +264,13 @@ step2_back_btn   = widgets.Button(description="◂  Back", layout=widgets.Layout
 continue_btn     = widgets.Button(description="Generate DDL for Selected ▸", button_style="primary",
                                   layout=widgets.Layout(width="260px"))
 continue_status  = widgets.HTML("")
+cancel_btn       = widgets.Button(description="Cancel", button_style="danger", icon="stop",
+                                  layout=widgets.Layout(width="100px", display="none"))
+workers_dd       = widgets.Dropdown(options=DDL_WORKERS, value=8, description="Parallel",
+                                    tooltip="How many SHOW CREATE statements run at once",
+                                    layout=widgets.Layout(width="200px"), style=_S)
 # ---- Step 3 (DDL confirmation) ----
-preview_out      = widgets.Output()
+preview_out      = widgets.HTML("")
 back_btn         = widgets.Button(description="◂  Back", layout=widgets.Layout(width="100px"))
 confirm_btn      = widgets.Button(description="Confirm & Configure Destination ▸", button_style="success",
                                   layout=widgets.Layout(width="280px"))
@@ -431,7 +439,11 @@ def _show_create(r):
         except Exception:
             return spark.sql(f"SHOW CREATE FUNCTION `{sch}`.`{name}`").first()[0]
     else:
-        return spark.sql(f"SHOW CREATE TABLE `{sch}`.`{name}`").first()[0]
+        # Fully qualified: DDL runs on worker threads, so don't rely on the session's current catalog.
+        try:
+            return spark.sql(f"SHOW CREATE TABLE `{cat}`.`{sch}`.`{name}`").first()[0]
+        except Exception:
+            return spark.sql(f"SHOW CREATE TABLE `{sch}`.`{name}`").first()[0]
 
 def on_list_objects(_):
     global results, catalog, selected_schemas
@@ -615,9 +627,95 @@ def set_all_filtered(value):
     update_counts()
 
 _ddl_confirm = {"n": None}
+_ddl_run = {"thread": None, "cancel": threading.Event()}
+
+def _tag_worker():
+    """Tag this worker thread's Spark Connect operations so Cancel can interrupt them mid-query."""
+    try:
+        spark.addTag(DDL_TAG)
+    except Exception:
+        pass   # classic clusters / older runtimes: Cancel still stops queued work
+
+def _interrupt_in_flight():
+    try:
+        spark.interruptTag(DDL_TAG)
+    except Exception:
+        pass
+
+def on_cancel(_):
+    _ddl_run["cancel"].set()
+    cancel_btn.disabled = True
+    cancel_btn.description = "Cancelling…"
+    _interrupt_in_flight()
+
+def _set_running(running):
+    for w in (continue_btn, step2_back_btn, workers_dd):
+        w.disabled = running
+    continue_btn.description = "Generating DDL…" if running else "Generate DDL for Selected ▸"
+    cancel_btn.disabled = False
+    cancel_btn.description = "Cancel"
+    cancel_btn.layout.display = "" if running else "none"
+
+def _generate_ddl(to_generate, workers):
+    """Runs on a background thread so the kernel stays free to receive the Cancel click.
+    Worker threads only run SQL; all widget updates happen here, throttled."""
+    cancel = _ddl_run["cancel"]
+    total, done, skipped, t0, last = len(to_generate), 0, [], time.time(), 0.0
+
+    def one(r):
+        if cancel.is_set():
+            return r, None, "cancelled"
+        try:
+            return r, _show_create(r), None
+        except Exception as e:
+            return r, None, _short_err(e).splitlines()[0] if str(e) else type(e).__name__
+
+    try:
+        pool = ThreadPoolExecutor(max_workers=workers, initializer=_tag_worker)
+        futures = [pool.submit(one, r) for r in to_generate]
+        for f in as_completed(futures):
+            r, ddl, err = f.result()
+            done += 1
+            if ddl is not None:
+                r["ddl"] = ddl
+                r["kind"] = _kind_from_ddl(ddl) or r["kind"]
+            elif not cancel.is_set():
+                skipped.append((_key(r), err))
+            now = time.time()
+            if cancel.is_set():
+                break
+            if now - last > 0.5 or done == total:   # throttle widget updates
+                last = now
+                eta = (now - t0) / done * (total - done)
+                continue_status.value = (f"<span style='color:#555'>⏳ Generating DDL… {done:,}/{total:,} "
+                                         f"({workers}× parallel){f' · ~{eta / 60:.0f} min left' if eta > 90 else ''}"
+                                         "</span>")
+        pool.shutdown(wait=True, cancel_futures=True)
+    except Exception as e:   # never leave the UI stuck in the running state
+        skipped.append(("(generator)", _short_err(e)))
+    finally:
+        _set_running(False)
+        render_objects()   # reveal "show DDL" expanders for newly generated objects
+        update_counts()
+
+    elapsed = time.time() - t0
+    if skipped:
+        source_out.append_stdout("".join(f"  - DDL generation failed for {k}: {reason[:120]}\n"
+                                         for k, reason in skipped[:25]))
+    if cancel.is_set():
+        got = sum(1 for r in to_generate if r["ddl"] is not None)
+        continue_status.value = (f"<span style='color:#a60'>⏹ Cancelled — generated {got:,} of {total:,} "
+                                 f"in {elapsed:.0f}s. Generated DDL is kept; click Generate again to "
+                                 "resume with the rest.</span>")
+        return
+    continue_status.value = (f"<span style='color:#a60'>⚠ {len(skipped):,} object(s) failed DDL generation "
+                             "and will be excluded from the payload.</span>" if skipped else "")
+    _show_preview()
 
 def on_preview_continue(_):
     """Step 2 -> Step 3: generate DDL for any newly selected objects, then show the confirmation panel."""
+    if _ddl_run["thread"] is not None and _ddl_run["thread"].is_alive():
+        return
     continue_status.value = ""
     if selected_count() == 0:
         continue_status.value = "<span style='color:#c00'>Select at least one object to continue.</span>"
@@ -626,55 +724,39 @@ def on_preview_continue(_):
     if len(to_generate) > DDL_CONFIRM_LIMIT and _ddl_confirm["n"] != len(to_generate):
         _ddl_confirm["n"] = len(to_generate)
         continue_status.value = (f"<span style='color:#a60'>⚠ This runs SHOW CREATE for "
-                                 f"<b>{len(to_generate):,}</b> objects, one at a time, and can take a long "
-                                 "time. Click again to proceed, or narrow the selection.</span>")
+                                 f"<b>{len(to_generate):,}</b> objects ({workers_dd.value}× parallel) and can "
+                                 "take a while. Click again to proceed (you can cancel), or narrow the "
+                                 "selection.</span>")
         return
     _ddl_confirm["n"] = None
-    if to_generate:
-        continue_btn.disabled = True
-        continue_btn.description = "Generating DDL…"
-        skipped, t0, last = [], time.time(), 0.0
-        for i, r in enumerate(to_generate, 1):
-            now = time.time()
-            if now - last > 0.5 or i == len(to_generate):   # throttle widget updates
-                last = now
-                eta = (now - t0) / (i - 1) * (len(to_generate) - i + 1) if i > 1 else 0
-                continue_status.value = (f"<span style='color:#555'>⏳ Generating DDL… {i:,}/{len(to_generate):,}"
-                                         f"{f' · ~{eta / 60:.0f} min left' if eta > 90 else ''}</span>")
-            try:
-                r["ddl"] = _show_create(r)
-                r["kind"] = _kind_from_ddl(r["ddl"]) or r["kind"]
-            except Exception as e:
-                skipped.append((_key(r), _short_err(e).splitlines()[0]))
-        continue_btn.disabled = False
-        continue_btn.description = "Generate DDL for Selected ▸"
-        if skipped:
-            continue_status.value = (f"<span style='color:#a60'>⚠ {len(skipped)} object(s) failed DDL "
-                                     f"generation and will be excluded from the payload.</span>")
-            with source_out:
-                for k, reason in skipped[:25]:
-                    print(f"  - DDL generation failed for {k}: {reason[:120]}")
-        else:
-            continue_status.value = ""
-        render_objects()   # reveal "show DDL" expanders for newly generated objects
-    preview_out.clear_output()
-    with preview_out:
-        payload = build_payload()
-        if not payload:
-            display(HTML("<div style='color:#c00'>No DDL was successfully generated for the selected objects.</div>"))
-            return
-        chosen = [r for r in results if selected.get(_key(r), False) and r.get("ddl")]
-        n = len(chosen)
-        shown = chosen[:PREVIEW_OBJECTS]
-        preview = "\n".join(f"-- {r['catalog']}.{r['schema']}.{r['name']}\n{r['ddl']};\n" for r in shown)
-        more = (f" Showing the first {len(shown):,}; all {n:,} will be submitted "
-                f"({len(payload.encode()) / 1e6:.1f} MB).") if n > len(shown) else ""
-        display(HTML(
-            f"<div style='font-size:12px;color:#555;margin-bottom:4px'>"
-            f"DDL for <b>{n:,}</b> selected object(s) — review, then confirm.{more}</div>"
-            "<div style='max-height:480px;overflow:auto;border:1px solid #ccc;padding:8px;"
-            "font-family:monospace;white-space:pre;font-size:12px'>"
-            f"{html.escape(preview)}</div>"))
+    if not to_generate:
+        _show_preview()
+        return
+    _ddl_run["cancel"].clear()
+    _set_running(True)
+    continue_status.value = "<span style='color:#555'>⏳ Generating DDL…</span>"
+    t = threading.Thread(target=_generate_ddl, args=(to_generate, workers_dd.value), daemon=True)
+    _ddl_run["thread"] = t
+    t.start()
+
+def _show_preview():
+    payload = build_payload()
+    if not payload:
+        preview_out.value = ("<div style='color:#c00'>No DDL was successfully generated for the "
+                             "selected objects.</div>")
+        return
+    chosen = [r for r in results if selected.get(_key(r), False) and r.get("ddl")]
+    n = len(chosen)
+    shown = chosen[:PREVIEW_OBJECTS]
+    preview = "\n".join(f"-- {r['catalog']}.{r['schema']}.{r['name']}\n{r['ddl']};\n" for r in shown)
+    more = (f" Showing the first {len(shown):,}; all {n:,} will be submitted "
+            f"({len(payload.encode()) / 1e6:.1f} MB).") if n > len(shown) else ""
+    preview_out.value = (
+        f"<div style='font-size:12px;color:#555;margin-bottom:4px'>"
+        f"DDL for <b>{n:,}</b> selected object(s) — review, then confirm.{more}</div>"
+        "<div style='max-height:480px;overflow:auto;border:1px solid #ccc;padding:8px;"
+        "font-family:monospace;white-space:pre;font-size:12px'>"
+        f"{html.escape(preview)}</div>")
     open_step(2)
 
 def on_confirm(_):
@@ -946,6 +1028,7 @@ select_all_btn.on_click(lambda b: set_all_filtered(True))
 select_none_btn.on_click(lambda b: set_all_filtered(False))
 step2_back_btn.on_click(lambda _: open_step(0))
 continue_btn.on_click(on_preview_continue)
+cancel_btn.on_click(on_cancel)
 back_btn.on_click(lambda _: open_step(1))
 confirm_btn.on_click(on_confirm)
 connect_btn.on_click(on_connect)
@@ -983,7 +1066,8 @@ _step1 = widgets.VBox([catalog_dd, catalog_hint, foreign_note, load_schemas_btn,
                        widgets.HBox([kind_label, inc_tables_w, inc_views_w, inc_funcs_w]),
                        generate_btn, source_out])
 _step2 = widgets.VBox([
-    widgets.HBox([step2_back_btn, continue_btn, continue_status]),
+    widgets.HBox([step2_back_btn, continue_btn, cancel_btn, workers_dd]),
+    continue_status,
     widgets.HBox([filter_w, filter_btn]),
     widgets.HBox([options_label, select_all_btn, select_none_btn, select_page_btn, objects_summary]),
     widgets.HBox([page_size_dd, prev_btn, next_btn, page_label],
