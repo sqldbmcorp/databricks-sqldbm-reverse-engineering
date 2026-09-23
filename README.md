@@ -117,7 +117,7 @@ reports:
 - **Compute** — cluster type (*Classic cluster* vs *Serverless / Spark Connect*) and the
   Databricks Runtime version. This is the compute, **not** the metastore.
 - **Catalogs / UC** — whether Unity Catalog is enabled or the workspace is
-  Hive-metastore-only, plus the current catalog and the full `SHOW CATALOGS` list.
+  Hive-metastore-only, plus the full `SHOW CATALOGS` list.
 - **SqlDBM API** — GETs `https://api.sqldbm.com/swagger/v1/swagger.json` and expects
   HTTP 200, confirming the cluster can reach the SqlDBM REST API.
 - **Script host** — confirms the cluster can fetch `import.py` from GitHub. It probes the

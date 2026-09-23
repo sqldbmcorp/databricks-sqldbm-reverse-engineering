@@ -842,16 +842,10 @@ catalog_dd.options = [("— select a catalog —", None)] + [
     (f"{c}   ⚠ foreign (federated)" if _is_foreign(c) else c, c) for c in _catalog_names]
 catalog_dd.value = None
 _n_foreign = sum(1 for c in _catalog_names if _is_foreign(c))
-try:
-    _cur = spark.catalog.currentCatalog()
-except Exception:
-    _cur = None
 catalog_hint.value = (
     "<div style='margin:0 0 4px 128px;font-size:12px;color:#666'>"
-    + (f"Current catalog: <code>{html.escape(_cur)}</code>. " if _cur else "")
-    + (f"{_n_foreign} catalog(s) marked ⚠ foreign are Lakehouse Federation sources — schemas load "
-       "only on request." if _n_foreign else "")
-    + "</div>")
+    f"{_n_foreign} catalog(s) marked ⚠ foreign are Lakehouse Federation sources — schemas load "
+    "only on request.</div>") if _n_foreign else ""
 refresh_conditional_fields()
 render_review()
 
@@ -934,21 +928,17 @@ def _catalog_info():
     try:
         cats = sorted(r[0] for r in spark.sql("SHOW CATALOGS").collect())
     except Exception as e:
-        return "?", [], False, f"SHOW CATALOGS failed: {str(e).splitlines()[0][:80]}"
-    try:
-        cur = spark.catalog.currentCatalog()
-    except Exception:
-        cur = "?"
+        return [], False, f"SHOW CATALOGS failed: {str(e).splitlines()[0][:80]}"
     uc = ("system" in cats) or ("hive_metastore" in cats) or \
          any(c not in {"spark_catalog", "samples", "hive_metastore"} for c in cats)
     note = "Unity Catalog appears ENABLED" if uc else "No Unity Catalog detected (Hive metastore only)"
-    return cur, cats, uc, note
+    return cats, uc, note
 
 def run_preflight(_=None):
     preflight_out.clear_output()
     with preflight_out:
         dbr, compute = _runtime_info()
-        cur, cats, uc, uc_note = _catalog_info()
+        cats, uc, uc_note = _catalog_info()
         sql_reach, sql_code, _sql_d = _probe(SQLDBM_BASE + "/swagger/v1/swagger.json")
         gh_reach, gh_code, gh_d = _probe(RAW_URL)
 
@@ -987,9 +977,9 @@ def run_preflight(_=None):
                  "all-purpose / job cluster; 'Serverless / Spark Connect' = serverless compute. "
                  "This is NOT the metastore — Hive vs Unity Catalog is the Catalogs / UC row below."),
             line("ok" if uc else "warn", "Catalogs / UC",
-                 f"{uc_note} · current='{cur}' · [{', '.join(cats) if cats else 'none'}]",
-                 "Whether the workspace uses Unity Catalog or is Hive-metastore-only, plus the current "
-                 "catalog and the full SHOW CATALOGS list."),
+                 f"{uc_note} · [{', '.join(cats) if cats else 'none'}]",
+                 "Whether the workspace uses Unity Catalog or is Hive-metastore-only, plus the full "
+                 "SHOW CATALOGS list."),
             line(sql_state, "SqlDBM API (api.sqldbm.com)", sql_text,
                  "GETs the SqlDBM OpenAPI doc (/swagger/v1/swagger.json) and expects HTTP 200, confirming "
                  "this cluster can reach the SqlDBM REST API."),
