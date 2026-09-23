@@ -26,7 +26,7 @@ and renders the widgets inline. Then:
 1. Check the **Environment preflight** banner at the top — all four rows should be green
    (Compute is informational). Hover any row label for an explanation.
 2. **Step 1 · Select Catalog and Schema(s)** — pick a catalog (none is pre-selected), then
-   schema(s), and click *List Objects*. Catalogs marked **⚠ foreign** are Lakehouse
+   schema(s), optionally a *Name filter* and object types, and click *List Objects*. Catalogs marked **⚠ foreign** are Lakehouse
    Federation sources — see [Foreign catalogs](#foreign-lakehouse-federation-catalogs).
 3. **Step 2 · Select Objects and Generate DDL** — review the object list; uncheck anything
    you don't want; click *Generate DDL for Selected*.
@@ -57,9 +57,10 @@ where it matters:
   individual objects before anything is sent.
 - **Pushes via the SqlDBM API.** Creates a project, a revision on the latest, a revision on
   a chosen revision, or routes through a branch for Concurrent-Working projects.
-- **Consistent with the SqlDBM app.** Extraction uses the same Spark primitives
-  (`setCurrentCatalog` → `listTables` → `SHOW CREATE TABLE`) as SqlDBM's own
-  reverse-engineering tool, so the generated DDL matches what the product would produce.
+- **Consistent with the SqlDBM app.** DDL comes from the same `SHOW CREATE TABLE` /
+  `SHOW CREATE FUNCTION` statements SqlDBM's own reverse-engineering tool uses, so the
+  generated DDL matches what the product would produce. (Object *names* are enumerated with
+  `SHOW TABLES` / `SHOW VIEWS` rather than `listTables`, which scales to very large schemas.)
 - **Honest about restricted environments.** A built-in preflight reports compute type,
   Unity Catalog vs Hive metastore, and endpoint reachability, so users on locked-down or
   government clouds see what will and won't work before they start.
@@ -71,12 +72,15 @@ where it matters:
 When the bootstrap runs, the notebook renders an **Environment preflight** banner followed
 by a four-step accordion (only one step open at a time):
 
-1. **Select Catalog and Schema(s)** — choose a catalog, select one or more schemas, and
-   click *List Objects*. No catalog is selected on load, so nothing is queried until you
-   pick one. Foreign catalogs are flagged and never queried automatically.
-2. **Select Objects and Generate DDL** — every discovered object appears as a checkbox
-   (grouped by schema, DDL hidden behind a caret). Filter by name, *Select all* /
-   *Deselect all*, then click *Generate DDL for Selected* to build the DDL payload.
+1. **Select Catalog and Schema(s)** — choose a catalog, select one or more schemas,
+   optionally enter a **Name filter** and choose which object types to include (Tables,
+   Views, Functions), and click *List Objects*. No catalog is selected on load, so nothing
+   is queried until you pick one. Foreign catalogs are flagged and never queried
+   automatically.
+2. **Select Objects and Generate DDL** — discovered objects appear as checkboxes, grouped
+   by schema and **paginated** (100 / 250 / 500 per page). Filter by name, *Select all
+   matching* / *Deselect all matching* / *Select this page*, then click *Generate DDL for
+   Selected* to build the DDL payload.
 3. **DDL Confirmation** — review the exact DDL that will be sent, then click
    *Confirm & Configure Destination*.
 4. **Configure Destination Project** — enter your SqlDBM API token, click
@@ -126,6 +130,26 @@ reports:
 It also lists any foreign (Lakehouse Federation) catalogs it finds.
 
 Any non-passing check prints a plain-language note explaining how to remediate it.
+
+---
+
+## Large schemas
+
+The importer is built to handle schemas with tens of thousands of objects:
+
+- **Filter before you list.** Step 1's *Name filter* is sent to Databricks as
+  `SHOW TABLES … LIKE '<pattern>'`, so only matching names come back. Patterns are
+  case-insensitive; `*` matches any characters and `|` separates alternatives — e.g.
+  `fact_*|dim_*` or `*_2024*`. Untick *Views* or *Functions* to skip those types.
+- **Fast enumeration.** Names come from one `SHOW TABLES` and one `SHOW VIEWS` per schema,
+  not per-table metadata lookups. Exact kinds (streaming table, materialized view) are
+  confirmed once DDL is generated.
+- **Paginated selection.** Step 2 renders one page at a time; selection is tracked
+  separately, so *Select all matching* covers every match, not just the visible page.
+- **Nothing pre-selected above 500 objects**, so a large listing can't accidentally turn
+  into tens of thousands of `SHOW CREATE` calls. Generating DDL for more than 1,000 objects
+  asks for a second click and shows progress with an estimated time remaining.
+- **Step 3 previews the first 200 objects** and reports the full payload size.
 
 ---
 

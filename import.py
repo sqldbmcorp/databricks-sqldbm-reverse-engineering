@@ -145,7 +145,10 @@ selected = {}           # object_key -> bool  (selection lives here, NOT in widg
 _schema_headers = {}    # schema -> (widgets.HTML, objs_list) — live header widgets for dynamic counts
 catalog = ""
 selected_schemas = []
-RENDER_CAP = 300        # max checkbox rows rendered at once; filter to reach the rest
+PAGE_SIZES = [100, 250, 500]   # checkbox rows rendered per Step 2 page
+AUTO_SELECT_LIMIT = 500        # listings larger than this start with nothing selected
+DDL_CONFIRM_LIMIT = 1000       # generating DDL for more objects than this asks for a second click
+PREVIEW_OBJECTS = 200          # Step 3 renders DDL for at most this many objects
 
 NEW_PROJECT = "➕  Create new project"
 NEW_BRANCH = "➕  Create new branch"
@@ -222,6 +225,17 @@ load_schemas_btn = widgets.Button(description="Try loading schemas anyway", butt
 _catalog_meta = {}      # catalog -> {"type", "connection"} (filled at init)
 schema_sel   = widgets.SelectMultiple(description="Schema(s)", options=[], rows=8,
                                       layout=widgets.Layout(**_W), style=_S)
+name_filter_w = widgets.Text(description="Name filter",
+                             placeholder="optional — e.g. fact_*|dim_*   (* = any, | = or)",
+                             layout=widgets.Layout(**_W), style=_S)
+kind_label   = widgets.Label("Include", layout=widgets.Layout(width="120px", display="flex",
+                                                              justify_content="flex-end"))
+inc_tables_w = widgets.Checkbox(value=True, description="Tables", indent=False,
+                                layout=widgets.Layout(width="90px"))
+inc_views_w  = widgets.Checkbox(value=True, description="Views", indent=False,
+                                layout=widgets.Layout(width="90px"))
+inc_funcs_w  = widgets.Checkbox(value=True, description="Functions", indent=False,
+                                layout=widgets.Layout(width="110px"))
 generate_btn = widgets.Button(description="List Objects", button_style="primary",
                               layout=widgets.Layout(width="220px", margin="10px 130px"))
 source_out   = widgets.Output()
@@ -234,8 +248,15 @@ objects_summary  = widgets.HTML("List objects in Step 1 to populate this list.")
 objects_container= widgets.VBox([], layout=widgets.Layout(margin="0 0 0 128px"))
 options_label    = widgets.Label("Options", layout=widgets.Layout(width="120px", display="flex",
                                                                   justify_content="flex-end"))
-select_all_btn   = widgets.Button(description="Select all", layout=widgets.Layout(width="140px"))
-select_none_btn  = widgets.Button(description="Deselect all", layout=widgets.Layout(width="140px"))
+select_all_btn   = widgets.Button(description="Select all matching", layout=widgets.Layout(width="160px"))
+select_none_btn  = widgets.Button(description="Deselect all matching", layout=widgets.Layout(width="170px"))
+select_page_btn  = widgets.Button(description="Select this page", layout=widgets.Layout(width="140px"))
+page_size_dd     = widgets.Dropdown(options=PAGE_SIZES, value=250, description="Per page",
+                                    layout=widgets.Layout(width="200px"), style=_S)
+prev_btn         = widgets.Button(description="◂ Prev", layout=widgets.Layout(width="80px"))
+next_btn         = widgets.Button(description="Next ▸", layout=widgets.Layout(width="80px"))
+page_label       = widgets.HTML("")
+_page = {"i": 0}
 step2_back_btn   = widgets.Button(description="◂  Back", layout=widgets.Layout(width="100px"))
 continue_btn     = widgets.Button(description="Generate DDL for Selected ▸", button_style="primary",
                                   layout=widgets.Layout(width="260px"))
@@ -341,14 +362,62 @@ def _kind_from_tabletype(table_type):
         return "MATERIALIZED VIEW"
     return "TABLE"
 
-def _list_user_functions(cat, schema):
-    """Return bare function names for user-defined functions in catalog.schema."""
+def _kind_from_ddl(ddl):
+    """Exact object kind from SHOW CREATE output (e.g. streaming tables list as TABLE until then)."""
+    head = " ".join((ddl or "").split()[:6]).upper()
+    for k in ("MATERIALIZED VIEW", "STREAMING TABLE", "VIEW", "FUNCTION", "TABLE"):
+        if k in head:
+            return k
+    return None
+
+def _like(pattern):
+    """SHOW ... LIKE clause. Databricks patterns: * = any chars, | = alternatives, case-insensitive."""
+    pattern = (pattern or "").strip()
+    return f" LIKE '{pattern.replace(chr(39), chr(39) * 2)}'" if pattern else ""
+
+def _list_schema_objects(cat, schema, pattern="", want_tables=True, want_views=True):
+    """[(name, kind)] for one schema via SHOW TABLES + SHOW VIEWS — one metadata call each, with the
+    name filter applied by the server. spark.catalog.listTables() instead loads full metadata per
+    table, which is very slow at tens of thousands of tables (and a remote round trip per table on a
+    foreign catalog). Falls back to listTables() if SHOW TABLES is unsupported."""
+    ref = f"`{cat}`.`{schema}`"
     try:
-        rows = spark.sql(f"SHOW USER FUNCTIONS IN `{cat}`.`{schema}`").collect()
+        tables = spark.sql(f"SHOW TABLES IN {ref}{_like(pattern)}").collect()
+    except Exception:
+        spark.catalog.setCurrentCatalog(cat)
+        out = []
+        for t in spark.catalog.listTables(schema):
+            kind = _kind_from_tabletype(getattr(t, "tableType", None))
+            if not t.isTemporary and (want_views if "VIEW" in kind else want_tables):
+                out.append((t.name, kind))
+        return out
+    views = {}
+    try:
+        for row in spark.sql(f"SHOW VIEWS IN {ref}{_like(pattern)}").collect():
+            d = row.asDict()
+            if not d.get("isTemporary"):
+                views[d["viewName"]] = "MATERIALIZED VIEW" if d.get("isMaterialized") else "VIEW"
+    except Exception:
+        pass   # SHOW VIEWS unsupported here — views list as TABLE until their DDL is generated
+    out = []
+    for row in tables:
+        d = row.asDict()
+        if d.get("isTemporary"):
+            continue
+        kind = views.get(d["tableName"], "TABLE")
+        if want_views if "VIEW" in kind else want_tables:
+            out.append((d["tableName"], kind))
+    return out
+
+def _list_user_functions(cat, schema, pattern=""):
+    """Return bare function names for user-defined functions in catalog.schema."""
+    like = _like(pattern)
+    try:
+        rows = spark.sql(f"SHOW USER FUNCTIONS IN `{cat}`.`{schema}`{like}").collect()
         return [row[0].rsplit(".", 1)[-1] for row in rows]
     except Exception:
         try:
-            rows = spark.sql(f"SHOW USER FUNCTIONS IN `{schema}`").collect()
+            rows = spark.sql(f"SHOW USER FUNCTIONS IN `{schema}`{like}").collect()
             return [row[0].rsplit(".", 1)[-1] for row in rows]
         except Exception:
             return []
@@ -381,9 +450,15 @@ def on_list_objects(_):
             print("Select a catalog and at least one schema, then click List Objects."
                   if catalog else "Select a catalog first.")
             return
+        if not (inc_tables_w.value or inc_views_w.value or inc_funcs_w.value):
+            generate_btn.disabled = False
+            generate_btn.description = "List Objects"
+            print("Include at least one object type (Tables, Views or Functions).")
+            return
         res, skipped = [], []
-        # Mirrors the tool's DatabricksGetStructure: set current catalog, then
-        # listTables(database), skip temporary tables, and list user functions.
+        pattern = name_filter_w.value
+        # Set the current catalog (SHOW CREATE TABLE in Step 2 relies on it, as in the tool's
+        # DatabricksGetStructure), then enumerate names per schema with the filter pushed down.
         try:
             spark.catalog.setCurrentCatalog(catalog)
         except Exception as e:
@@ -391,30 +466,37 @@ def on_list_objects(_):
             generate_btn.description = "List Objects"
             print(f"Could not set current catalog '{catalog}': {_short_err(e)}")
             return
-        for schema in selected_schemas:
-            try:
-                tbls = spark.catalog.listTables(schema)
-            except Exception as e:
-                skipped.append((schema, _short_err(e).splitlines()[0]))
-                continue
-            for t in tbls:
-                if t.isTemporary:
+        t0 = time.time()
+        for n, schema in enumerate(selected_schemas, 1):
+            generate_btn.description = f"Listing {n}/{len(selected_schemas)}…"
+            if inc_tables_w.value or inc_views_w.value:
+                try:
+                    objs = _list_schema_objects(catalog, schema, pattern,
+                                                inc_tables_w.value, inc_views_w.value)
+                except Exception as e:
+                    skipped.append((schema, _short_err(e).splitlines()[0]))
                     continue
-                res.append({"catalog": catalog, "schema": schema, "name": t.name,
-                            "kind": _kind_from_tabletype(getattr(t, "tableType", None)),
-                            "ddl": None})
-            for fn in _list_user_functions(catalog, schema):
-                res.append({"catalog": catalog, "schema": schema, "name": fn,
-                            "kind": "FUNCTION", "ddl": None})
+                res.extend({"catalog": catalog, "schema": schema, "name": name, "kind": kind,
+                            "ddl": None} for name, kind in objs)
+            if inc_funcs_w.value:
+                res.extend({"catalog": catalog, "schema": schema, "name": fn, "kind": "FUNCTION",
+                            "ddl": None} for fn in _list_user_functions(catalog, schema, pattern))
+        res.sort(key=lambda r: (r["schema"], r["name"].lower()))
         results = res
-        print(f"Found {len(res)} object(s) across {len(selected_schemas)} schema(s). "
+        print(f"Found {len(res):,} object(s) across {len(selected_schemas)} schema(s)"
+              f"{f' matching {pattern.strip()!r}' if pattern.strip() else ''} in {time.time() - t0:.1f}s. "
               f"{len(skipped)} schema(s) failed. Select objects in Step 2, then generate DDL.")
+        if len(res) > AUTO_SELECT_LIMIT:
+            print(f"More than {AUTO_SELECT_LIMIT:,} objects, so nothing is pre-selected — use the Step 2 "
+                  "filter and 'Select all matching', or narrow the Name filter here and list again.")
         for s, reason in skipped[:25]:
             print(f"  - skipped {s}: {reason[:120]}")
     generate_btn.disabled = False
     generate_btn.description = "List Objects"
     global selected
-    selected = {_key(r): True for r in results}
+    auto = len(results) <= AUTO_SELECT_LIMIT
+    selected = {_key(r): auto for r in results}
+    _page["i"] = 0
     filter_w.value = ""
     render_objects()
     update_counts()
@@ -436,7 +518,7 @@ def current_matches():
     return [r for r in results if q in f"{_key(r)} {_kind(r)}".lower()]
 
 def selected_count():
-    return sum(1 for r in results if selected.get(_key(r), False))
+    return sum(1 for v in selected.values() if v)
 
 def build_payload():
     return "\n".join(f"-- {r['catalog']}.{r['schema']}.{r['name']}\n{r['ddl']};\n"
@@ -449,7 +531,7 @@ def on_toggle(change, key):
 def update_counts(*_):
     """Cheap: refresh counters + the destination review. Does NOT build the DDL payload."""
     total = len(results)
-    objects_summary.value = (f"<b>{selected_count()}</b> of {total} object(s) selected"
+    objects_summary.value = (f"<b>{selected_count():,}</b> of {total:,} object(s) selected"
                              if total else "List objects in Step 1 to populate this list.")
     for schema, (hdr, objs) in _schema_headers.items():
         sel_n = sum(1 for r in objs if selected.get(_key(r), False))
@@ -458,55 +540,72 @@ def update_counts(*_):
                      f"<span style='font-weight:400;color:#777'>({sel_n}/{len(objs)} selected)</span></div>")
     render_review()
 
+def _page_count(n):
+    return max(1, -(-n // page_size_dd.value))
+
 def render_objects(*_):
-    """Render only the filtered slice, capped at RENDER_CAP rows, grouped by schema."""
+    """Render one page of the filtered objects, grouped by schema. Selection lives in `selected`,
+    so only the visible page ever becomes widgets."""
     global _schema_headers
     if not results:
         objects_container.children = []
         _schema_headers = {}
+        page_label.value = ""
         return
-    matches = current_matches()
+    matches = current_matches()          # already sorted by (schema, name)
+    size, pages = page_size_dd.value, _page_count(len(matches))
+    _page["i"] = min(max(_page["i"], 0), pages - 1)
+    lo = _page["i"] * size
+    page = matches[lo:lo + size]
+    prev_btn.disabled = _page["i"] == 0
+    next_btn.disabled = _page["i"] >= pages - 1
+    page_label.value = (f"<span style='color:#555'>Page <b>{_page['i'] + 1}</b> of {pages:,} · "
+                        f"{lo + 1 if page else 0:,}–{lo + len(page):,} of {len(matches):,} matching</span>")
+    page_schemas = {r["schema"] for r in page}
     by_schema = {}
-    for r in matches:
-        by_schema.setdefault(r["schema"], []).append(r)
+    for r in matches:                    # header counts cover every match in the schema, not just this page
+        if r["schema"] in page_schemas:
+            by_schema.setdefault(r["schema"], []).append(r)
     _schema_headers = {}
-    children, shown, capped = [], 0, False
-    for schema in sorted(by_schema):
-        objs = sorted(by_schema[schema], key=lambda x: x["name"].lower())
-        sel_n = sum(1 for r in objs if selected.get(_key(r), False))
-        hdr = widgets.HTML(
-            f"<div style='font-weight:600;margin:8px 0 2px'>{html.escape(catalog)}.{html.escape(schema)} "
-            f"<span style='font-weight:400;color:#777'>({sel_n}/{len(objs)} selected)</span></div>")
-        _schema_headers[schema] = (hdr, objs)
-        children.append(hdr)
-        for r in objs:
-            if shown >= RENDER_CAP:
-                capped = True
-                break
-            k = _key(r)
-            chk = widgets.Checkbox(value=selected.get(k, True), indent=False,
-                                   description=f"{r['name']}   ·   {_kind(r)}",
-                                   layout=widgets.Layout(width="380px", margin="0"))
-            chk.observe(functools.partial(on_toggle, key=k), names="value")
-            row_widgets = [chk]
-            if r.get("ddl"):
-                details = widgets.HTML(
-                    "<details style='margin:0 0 4px 26px'>"
-                    "<summary style='cursor:pointer;font-size:12px;color:#555'>show DDL</summary>"
-                    "<div style='max-height:300px;overflow:auto;border:1px solid #ddd;padding:6px;"
-                    "font-family:monospace;white-space:pre;font-size:12px;margin-top:4px'>"
-                    f"{html.escape(r['ddl'])}</div></details>")
-                row_widgets.append(details)
-            children.append(widgets.VBox(row_widgets, layout=widgets.Layout(margin="0")))
-            shown += 1
-        if capped:
-            break
-    if capped:
-        children.append(widgets.HTML(
-            f"<div style='color:#a60;margin-top:6px'>Showing first {RENDER_CAP} of {len(matches)} "
-            f"matching objects — refine the Filter to see more. Select / Deselect all still apply "
-            f"to all {len(matches)} matches.</div>"))
+    children, cur = [], None
+    for r in page:
+        schema = r["schema"]
+        if schema != cur:
+            cur, objs = schema, by_schema[schema]
+            sel_n = sum(1 for o in objs if selected.get(_key(o), False))
+            hdr = widgets.HTML(
+                f"<div style='font-weight:600;margin:8px 0 2px'>{html.escape(catalog)}.{html.escape(schema)} "
+                f"<span style='font-weight:400;color:#777'>({sel_n}/{len(objs)} selected)</span></div>")
+            _schema_headers[schema] = (hdr, objs)
+            children.append(hdr)
+        k = _key(r)
+        chk = widgets.Checkbox(value=selected.get(k, False), indent=False,
+                               description=f"{r['name']}   ·   {_kind(r)}",
+                               layout=widgets.Layout(width="380px", margin="0"))
+        chk.observe(functools.partial(on_toggle, key=k), names="value")
+        row_widgets = [chk]
+        if r.get("ddl"):
+            details = widgets.HTML(
+                "<details style='margin:0 0 4px 26px'>"
+                "<summary style='cursor:pointer;font-size:12px;color:#555'>show DDL</summary>"
+                "<div style='max-height:300px;overflow:auto;border:1px solid #ddd;padding:6px;"
+                "font-family:monospace;white-space:pre;font-size:12px;margin-top:4px'>"
+                f"{html.escape(r['ddl'])}</div></details>")
+            row_widgets.append(details)
+        children.append(widgets.VBox(row_widgets, layout=widgets.Layout(margin="0")))
     objects_container.children = children
+
+def go_page(delta=None, reset=False):
+    _page["i"] = 0 if reset else _page["i"] + delta
+    render_objects()
+
+def select_page():
+    matches = current_matches()
+    lo = _page["i"] * page_size_dd.value
+    for r in matches[lo:lo + page_size_dd.value]:
+        selected[_key(r)] = True
+    render_objects()
+    update_counts()
 
 def set_all_filtered(value):
     """Apply to every object matching the current filter (not just the rendered slice)."""
@@ -515,6 +614,8 @@ def set_all_filtered(value):
     render_objects()
     update_counts()
 
+_ddl_confirm = {"n": None}
+
 def on_preview_continue(_):
     """Step 2 -> Step 3: generate DDL for any newly selected objects, then show the confirmation panel."""
     continue_status.value = ""
@@ -522,16 +623,29 @@ def on_preview_continue(_):
         continue_status.value = "<span style='color:#c00'>Select at least one object to continue.</span>"
         return
     to_generate = [r for r in results if selected.get(_key(r), False) and r["ddl"] is None]
+    if len(to_generate) > DDL_CONFIRM_LIMIT and _ddl_confirm["n"] != len(to_generate):
+        _ddl_confirm["n"] = len(to_generate)
+        continue_status.value = (f"<span style='color:#a60'>⚠ This runs SHOW CREATE for "
+                                 f"<b>{len(to_generate):,}</b> objects, one at a time, and can take a long "
+                                 "time. Click again to proceed, or narrow the selection.</span>")
+        return
+    _ddl_confirm["n"] = None
     if to_generate:
         continue_btn.disabled = True
         continue_btn.description = "Generating DDL…"
-        skipped = []
+        skipped, t0, last = [], time.time(), 0.0
         for i, r in enumerate(to_generate, 1):
-            continue_status.value = f"<span style='color:#555'>⏳ Generating DDL… {i}/{len(to_generate)}</span>"
+            now = time.time()
+            if now - last > 0.5 or i == len(to_generate):   # throttle widget updates
+                last = now
+                eta = (now - t0) / (i - 1) * (len(to_generate) - i + 1) if i > 1 else 0
+                continue_status.value = (f"<span style='color:#555'>⏳ Generating DDL… {i:,}/{len(to_generate):,}"
+                                         f"{f' · ~{eta / 60:.0f} min left' if eta > 90 else ''}</span>")
             try:
                 r["ddl"] = _show_create(r)
+                r["kind"] = _kind_from_ddl(r["ddl"]) or r["kind"]
             except Exception as e:
-                skipped.append((_key(r), str(e).splitlines()[0]))
+                skipped.append((_key(r), _short_err(e).splitlines()[0]))
         continue_btn.disabled = False
         continue_btn.description = "Generate DDL for Selected ▸"
         if skipped:
@@ -549,13 +663,18 @@ def on_preview_continue(_):
         if not payload:
             display(HTML("<div style='color:#c00'>No DDL was successfully generated for the selected objects.</div>"))
             return
-        n = sum(1 for r in results if selected.get(_key(r), False) and r.get("ddl"))
+        chosen = [r for r in results if selected.get(_key(r), False) and r.get("ddl")]
+        n = len(chosen)
+        shown = chosen[:PREVIEW_OBJECTS]
+        preview = "\n".join(f"-- {r['catalog']}.{r['schema']}.{r['name']}\n{r['ddl']};\n" for r in shown)
+        more = (f" Showing the first {len(shown):,}; all {n:,} will be submitted "
+                f"({len(payload.encode()) / 1e6:.1f} MB).") if n > len(shown) else ""
         display(HTML(
             f"<div style='font-size:12px;color:#555;margin-bottom:4px'>"
-            f"DDL for <b>{n}</b> selected object(s) — review, then confirm:</div>"
+            f"DDL for <b>{n:,}</b> selected object(s) — review, then confirm.{more}</div>"
             "<div style='max-height:480px;overflow:auto;border:1px solid #ccc;padding:8px;"
             "font-family:monospace;white-space:pre;font-size:12px'>"
-            f"{html.escape(payload)}</div>"))
+            f"{html.escape(preview)}</div>"))
     open_step(2)
 
 def on_confirm(_):
@@ -817,8 +936,12 @@ def _show_links(seg, project_id, branch_id=None, branch_name=None):
 catalog_dd.observe(on_catalog_change, names="value")
 load_schemas_btn.on_click(lambda _: _load_schemas(catalog_dd.value) if catalog_dd.value else None)
 generate_btn.on_click(on_list_objects)
-filter_w.observe(render_objects, names="value")
-filter_btn.on_click(lambda _: render_objects())
+filter_w.observe(lambda _: go_page(reset=True), names="value")
+filter_btn.on_click(lambda _: go_page(reset=True))
+page_size_dd.observe(lambda _: go_page(reset=True), names="value")
+prev_btn.on_click(lambda _: go_page(-1))
+next_btn.on_click(lambda _: go_page(1))
+select_page_btn.on_click(lambda _: select_page())
 select_all_btn.on_click(lambda b: set_all_filtered(True))
 select_none_btn.on_click(lambda b: set_all_filtered(False))
 step2_back_btn.on_click(lambda _: open_step(0))
@@ -856,12 +979,17 @@ STEP_TITLES = [
     "4 · Configure Destination Project",
 ]
 _step1 = widgets.VBox([catalog_dd, catalog_hint, foreign_note, load_schemas_btn,
-                       schema_sel, generate_btn, source_out])
+                       schema_sel, name_filter_w,
+                       widgets.HBox([kind_label, inc_tables_w, inc_views_w, inc_funcs_w]),
+                       generate_btn, source_out])
 _step2 = widgets.VBox([
     widgets.HBox([step2_back_btn, continue_btn, continue_status]),
     widgets.HBox([filter_w, filter_btn]),
-    widgets.HBox([options_label, select_all_btn, select_none_btn, objects_summary]),
+    widgets.HBox([options_label, select_all_btn, select_none_btn, select_page_btn, objects_summary]),
+    widgets.HBox([page_size_dd, prev_btn, next_btn, page_label],
+                 layout=widgets.Layout(align_items="center")),
     objects_container,
+    widgets.HBox([prev_btn, next_btn], layout=widgets.Layout(margin="6px 0 0 128px")),
 ])
 _step3 = widgets.VBox([
     widgets.HBox([back_btn, confirm_btn]),
