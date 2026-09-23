@@ -783,7 +783,33 @@ def _failure_details(skipped, workers):
         for reason, keys in sorted(groups.items(), key=lambda kv: -len(kv[1]))[:8])
     return ("<details open style='margin-top:4px;font-size:12px;color:#444'>"
             f"<summary style='cursor:pointer'>Failure details ({_mode(workers)})</summary>"
-            f"{probe_line}<ul style='margin:4px 0 0 18px;padding:0'>{rows}</ul></details>")
+            f"{_permission_help(skipped)}{probe_line}"
+            f"<ul style='margin:4px 0 0 18px;padding:0'>{rows}</ul></details>")
+
+_PERMISSION_MARKERS = ("PERMISSION_DENIED", "INSUFFICIENT_PERMISSIONS", "UnauthorizedAccessException")
+
+def _permission_help(skipped):
+    """If failures are Unity Catalog permission errors, show the GRANTs an admin needs to run.
+    Listing only needs BROWSE, but SHOW CREATE TABLE reads the definition, which needs USE CATALOG,
+    USE SCHEMA and SELECT — so a user can list a catalog yet be unable to generate its DDL."""
+    denied = [k for k, reason in skipped if any(m in reason for m in _PERMISSION_MARKERS)]
+    if not denied:
+        return ""
+    schemas = sorted({k.split(".", 1)[0] for k in denied})
+    who = _user or "<user or group>"
+    q = lambda x: "`" + x.replace("`", "``") + "`"
+    grants = [f"GRANT USE CATALOG ON CATALOG {q(catalog)} TO {q(who)};"]
+    for sch in schemas:
+        grants.append(f"GRANT USE SCHEMA ON SCHEMA {q(catalog)}.{q(sch)} TO {q(who)};")
+        grants.append(f"GRANT SELECT ON SCHEMA {q(catalog)}.{q(sch)} TO {q(who)};")
+    return ("<div style='border:1px solid #e0b252;background:#fff8e6;padding:6px 8px;margin:4px 0;"
+            "max-width:760px'>🔒 <b>Permission denied</b> for "
+            f"{len(denied):,} object(s). You can <i>list</i> this catalog (BROWSE is enough for that), "
+            "but generating DDL with SHOW CREATE TABLE needs <b>USE CATALOG</b>, <b>USE SCHEMA</b> and "
+            "<b>SELECT</b> (or ownership). Ask a catalog owner or admin to run:"
+            "<pre style='margin:4px 0;padding:6px;background:#fff;border:1px solid #ddd;white-space:pre-wrap'>"
+            f"{html.escape(chr(10).join(grants))}</pre>"
+            "Granting to a group you belong to works too. Then click Generate again.</div>")
 
 def on_preview_continue(_):
     """Step 2 -> Step 3: generate DDL for any newly selected objects, then show the confirmation panel."""

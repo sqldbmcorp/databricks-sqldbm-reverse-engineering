@@ -107,7 +107,10 @@ by a four-step accordion (only one step open at a time):
   `spark.catalog.setCurrentCatalog`, `listTables`, and `listDatabases`, which require
   Spark 3.4+. (This is the same baseline SqlDBM's own tool requires.)
 - **`ipywidgets`**, available on current DBR and serverless compute.
-- **Unity Catalog / metastore read access** to the schemas you want to import.
+- **Unity Catalog / metastore read access** to the schemas you want to import:
+  `USE CATALOG`, `USE SCHEMA` and `SELECT` (or ownership). `BROWSE` alone lets you *list*
+  objects but not generate their DDL; if that happens, the notebook shows the `GRANT`
+  statements to ask an admin for.
 - **Outbound HTTPS** from the cluster to `api.sqldbm.com` and (for the bootstrap)
   `raw.githubusercontent.com`.
 
