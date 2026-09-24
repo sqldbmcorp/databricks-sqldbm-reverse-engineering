@@ -14,7 +14,7 @@ Requirements: ipywidgets (current DBR / serverless), Unity Catalog read access, 
 HTTPS to api.sqldbm.com. `spark` is taken from the calling notebook's globals.
 """
 
-import os, json, time, html, gzip, requests, functools, threading
+import os, re, json, time, html, gzip, requests, functools, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import ipywidgets as widgets
@@ -172,6 +172,8 @@ selected_schemas = []
 PAGE_SIZES = [100, 250, 500]   # checkbox rows rendered per Step 2 page
 AUTO_SELECT_LIMIT = 500        # listings larger than this start with nothing selected
 DDL_CONFIRM_LIMIT = 1000       # generating DDL for more objects than this asks for a second click
+CATALOG_NAME_OPTIONS = [("Discard names on upload", "discard"),
+                        ("Keep names on upload (use fully-qualified names)", "keep")]
 UNSUPPORTED_KINDS = {"STREAMING TABLE"}   # not yet importable into SqlDBM; excluded
 PREVIEW_OBJECTS = 200          # Step 3 renders DDL for at most this many objects
 DDL_WORKERS = [("Off (main thread, no Cancel)", 0), ("1", 1), ("4", 4), ("8", 8), ("16", 16)]
@@ -238,17 +240,38 @@ def _short_err(e):
     """First meaningful part of a Spark/JDBC error — drop the JVM stacktrace."""
     return str(e).split("JVM stacktrace")[0].strip()
 
-def _list_schemas(cat):
-    # Mirrors the tool's DatabricksGetStructure: set current catalog, then listDatabases().
-    spark.catalog.setCurrentCatalog(cat)
-    return sorted(d.name for d in spark.catalog.listDatabases())
+def _list_schemas(cat, pattern=""):
+    """Schema names via one SHOW SCHEMAS call, with the filter applied by the server.
+    spark.catalog.listDatabases() loads metadata per schema, which is slow on large catalogs;
+    it's the fallback (filtered client-side) if SHOW SCHEMAS is unsupported."""
+    try:
+        rows = spark.sql(f"SHOW SCHEMAS IN `{cat}`{_like(pattern)}").collect()
+        return sorted(r[0] for r in rows)
+    except Exception:
+        spark.catalog.setCurrentCatalog(cat)
+        names = sorted(d.name for d in spark.catalog.listDatabases())
+        return [n for n in names if _like_match(pattern, n)]
+
+def _like_match(pattern, name):
+    """Client-side twin of Databricks' SHOW … LIKE: * = any chars, | = alternatives, case-insensitive."""
+    pattern = (pattern or "").strip()
+    if not pattern:
+        return True
+    return any(re.fullmatch(".*".join(map(re.escape, alt.strip().split("*"))), name, re.I)
+               for alt in pattern.split("|"))
 
 catalog_dd   = widgets.Dropdown(description="Catalog", options=[],
                                 layout=widgets.Layout(**_W), style=_S)
 catalog_hint = widgets.HTML("")
 foreign_note = widgets.HTML("")
-load_schemas_btn = widgets.Button(description="Try loading schemas anyway", button_style="warning",
-                                  layout=widgets.Layout(width="240px", margin="4px 130px", display="none"))
+schema_filter_w = widgets.Text(description="Schema filter",
+                               placeholder="optional — e.g. sales*|finance_*   (* = any, | = or)",
+                               continuous_update=False, layout=widgets.Layout(**_W), style=_S)
+list_schemas_btn = widgets.Button(description="List Schemas", button_style="primary", disabled=True,
+                                  layout=widgets.Layout(width="220px", margin="4px 130px"))
+schema_status = widgets.HTML("")
+schema_all_btn = widgets.Button(description="Select all listed", layout=widgets.Layout(width="150px"))
+schema_none_btn = widgets.Button(description="Clear", layout=widgets.Layout(width="80px"))
 _catalog_meta = {}      # catalog -> {"type", "connection"} (filled at init)
 schema_sel   = widgets.SelectMultiple(description="Schema(s)", options=[], rows=8,
                                       layout=widgets.Layout(**_W), style=_S)
@@ -287,6 +310,9 @@ step2_back_btn   = widgets.Button(description="◂  Back", layout=widgets.Layout
 continue_btn     = widgets.Button(description="Generate DDL for Selected ▸", button_style="primary",
                                   layout=widgets.Layout(width="260px"))
 continue_status  = widgets.HTML("")
+catalog_names_w  = widgets.RadioButtons(options=CATALOG_NAME_OPTIONS, value="discard",
+                                        description="Catalog names",
+                                        layout=widgets.Layout(width="520px"), style=_S)
 cancel_btn       = widgets.Button(description="Cancel", button_style="danger", icon="stop",
                                   layout=widgets.Layout(width="100px", display="none"))
 workers_dd       = widgets.Dropdown(options=DDL_WORKERS, value=0, description="Parallel",
@@ -326,8 +352,7 @@ def _foreign_help_html(cat, expanded=False):
         f"{' — ' + conn_desc if conn_desc else ''}). "
         "Its schemas and tables are not stored in Unity Catalog; listing them, listing tables and "
         "SHOW CREATE TABLE are sent <i>live</i> to the external database from the compute running this "
-        "notebook. Schemas were not loaded automatically because that call can hang or fail if the "
-        "source is unreachable."
+        "notebook, so <i>List Schemas</i> can hang or fail if the source is unreachable."
         f"<details{' open' if expanded else ''} style='margin-top:6px'>"
         "<summary style='cursor:pointer;font-weight:600'>How to reverse-engineer from a foreign catalog</summary>"
         "<ol style='margin:6px 0 0 18px;padding:0'>"
@@ -346,43 +371,57 @@ def _foreign_help_html(cat, expanded=False):
         "<li><b>Confirm permissions:</b> <code>USE CATALOG</code> on the catalog, <code>USE SCHEMA</code> "
         "and <code>SELECT</code> on the schemas you want to import.</li>"
         f"<li><b>Test from a cell:</b> <code>SHOW SCHEMAS IN `{esc(cat)}`</code>. Once that returns, "
-        "click <i>Try loading schemas anyway</i> below.</li>"
+        "click <i>List Schemas</i> below.</li>"
         "<li><b>Or skip Databricks entirely:</b> DDL read through a foreign catalog uses Databricks' "
         "mapped types, not the source's native DDL. For a native model, create a SqlDBM project with the "
         "source database type (e.g. SQL Server) and reverse-engineer from that database directly.</li>"
         "</ol></details></div>")
 
-def _load_schemas(cat):
-    schema_sel.options = ["⏳ Loading schemas…"]
-    schema_sel.disabled = True
+def _hint(text, color="#666"):
+    return f"<div style='margin:0 0 4px 128px;font-size:12px;color:{color}'>{text}</div>"
+
+def on_list_schemas(_=None):
+    cat = catalog_dd.value
+    if not cat:
+        return
+    source_out.clear_output()
+    access_note.value = ""
+    schema_sel.options = []
+    pattern = schema_filter_w.value
+    list_schemas_btn.disabled = True
+    list_schemas_btn.description = "Listing schemas…"
+    schema_status.value = _hint("⏳ Listing schemas…", "#555")
+    t0 = time.time()
     try:
-        schema_sel.options = _list_schemas(cat)
-        load_schemas_btn.layout.display = "none"
+        names = _list_schemas(cat, pattern)
+        schema_sel.options = names
+        filt = f" matching <code>{html.escape(pattern.strip())}</code>" if pattern.strip() else ""
+        schema_status.value = _hint(
+            f"{len(names):,} schema(s){filt} in {time.time() - t0:.1f}s. Select one or more below."
+            if names else f"No schemas{filt}. Adjust the Schema filter and list again.",
+            "#666" if names else "#a60")
     except Exception as e:
-        schema_sel.options = []
+        schema_status.value = ""
         if _is_foreign(cat):
             foreign_note.value = _foreign_help_html(cat, expanded=True)
         with source_out:
             print(f"Could not list schemas for '{cat}': {_short_err(e)}")
     finally:
-        schema_sel.disabled = False
+        list_schemas_btn.disabled = False
+        list_schemas_btn.description = "List Schemas"
 
 def on_catalog_change(_=None):
+    """Picking a catalog only resets Step 1 — schemas load when the user clicks List Schemas, so a
+    large (or unreachable, federated) catalog is never enumerated without a chance to filter first."""
     source_out.clear_output()
     access_note.value = ""
     foreign_note.value = ""
-    load_schemas_btn.layout.display = "none"
     schema_sel.options = []
+    schema_status.value = ""
     cat = catalog_dd.value
-    if not cat:
-        return
-    if _is_foreign(cat):
-        # Don't auto-query a federated source: show the guidance and let the user opt in.
+    list_schemas_btn.disabled = not cat
+    if cat and _is_foreign(cat):
         foreign_note.value = _foreign_help_html(cat)
-        load_schemas_btn.description = "Try loading schemas anyway"
-        load_schemas_btn.layout.display = ""
-        return
-    _load_schemas(cat)
 
 def _kind_from_tabletype(table_type):
     tt = (table_type or "").upper()
@@ -569,9 +608,34 @@ def current_matches():
 def selected_count():
     return sum(1 for v in selected.values() if v)
 
+# SqlDBM's reverse-engineering "Catalog names" option. The OpenAPI always keeps database names
+# (DdlImportService.ParseDatabases = true), so "discard" is applied here by stripping the source
+# catalog from 3-part names before upload — the same result as the app's DatabaseInfoCleaner.
+_IDENT = r"(?:`(?:[^`]|``)+`|[A-Za-z_][\w$]*)"
+_STRING_LITERAL = re.compile(r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")""")
+
+def _discard_catalog(ddl, cat):
+    """`cat`.`schema`.`obj` -> `schema`.`obj` everywhere in the DDL (CREATE names, REFERENCES, view
+    bodies), leaving string literals and other catalogs' names untouched."""
+    names = {cat} | ({"hive_metastore", "spark_catalog"} if cat.lower() in ("hive_metastore", "spark_catalog") else set())
+    alts = []
+    for n in names:
+        alts.append("`" + re.escape(n.replace("`", "``")) + "`")
+        if re.fullmatch(r"[A-Za-z_][\w$]*", n):
+            alts.append(re.escape(n))
+    pat = re.compile(r"(?<![\w`.$])(?:" + "|".join(alts) + r")\s*\.\s*(?=" + _IDENT + r"\s*\.\s*" + _IDENT + ")",
+                     re.IGNORECASE)
+    parts = _STRING_LITERAL.split(ddl)
+    return "".join(p if i % 2 else pat.sub("", p) for i, p in enumerate(parts))
+
+def _ddl_for_upload(r):
+    keep = catalog_names_w.value == "keep"
+    header = f"-- {r['catalog']}.{r['schema']}.{r['name']}" if keep else f"-- {r['schema']}.{r['name']}"
+    ddl = r["ddl"] if keep else _discard_catalog(r["ddl"], r["catalog"])
+    return f"{header}\n{ddl};\n"
+
 def build_payload():
-    return "\n".join(f"-- {r['catalog']}.{r['schema']}.{r['name']}\n{r['ddl']};\n"
-                     for r in results if selected.get(_key(r), False) and r.get("ddl"))
+    return "\n".join(_ddl_for_upload(r) for r in results if selected.get(_key(r), False) and r.get("ddl"))
 
 def on_toggle(change, key):
     selected[key] = change["new"]
@@ -901,7 +965,7 @@ def on_preview_continue(_):
     _ddl_run["thread"] = t
     t.start()
 
-def _show_preview():
+def _show_preview(open_panel=True):
     payload = build_payload()
     if not payload:
         preview_out.value = ("<div style='color:#c00'>No DDL was successfully generated for the "
@@ -910,7 +974,7 @@ def _show_preview():
     chosen = [r for r in results if selected.get(_key(r), False) and r.get("ddl")]
     n = len(chosen)
     shown = chosen[:PREVIEW_OBJECTS]
-    preview = "\n".join(f"-- {r['catalog']}.{r['schema']}.{r['name']}\n{r['ddl']};\n" for r in shown)
+    preview = "\n".join(_ddl_for_upload(r) for r in shown)
     raw_n = len(payload.encode())
     wire_n = len(gzip.compress(payload.encode(), compresslevel=6))
     more = (f" Showing the first {len(shown):,}; all {n:,} will be submitted." if n > len(shown) else "")
@@ -926,7 +990,8 @@ def _show_preview():
         "<div style='max-height:480px;overflow:auto;border:1px solid #ccc;padding:8px;"
         "font-family:monospace;white-space:pre;font-size:12px'>"
         f"{html.escape(preview)}</div>")
-    open_step(2)
+    if open_panel:
+        open_step(2)
 
 def on_confirm(_):
     """Step 3 -> Step 4: open the destination panel."""
@@ -1192,7 +1257,9 @@ def _show_links(seg, project_id, branch_id=None, branch_name=None):
 
 # ============================================================ wire up
 catalog_dd.observe(on_catalog_change, names="value")
-load_schemas_btn.on_click(lambda _: _load_schemas(catalog_dd.value) if catalog_dd.value else None)
+list_schemas_btn.on_click(on_list_schemas)
+schema_all_btn.on_click(lambda _: setattr(schema_sel, "value", tuple(schema_sel.options)))
+schema_none_btn.on_click(lambda _: setattr(schema_sel, "value", ()))
 generate_btn.on_click(on_list_objects)
 filter_w.observe(lambda _: go_page(reset=True), names="value")
 filter_btn.on_click(lambda _: go_page(reset=True))
@@ -1204,6 +1271,8 @@ select_all_btn.on_click(lambda b: set_all_filtered(True))
 select_none_btn.on_click(lambda b: set_all_filtered(False))
 step2_back_btn.on_click(lambda _: open_step(0))
 continue_btn.on_click(on_preview_continue)
+catalog_names_w.observe(lambda _: _show_preview(open_panel=False) if preview_out.value else None,
+                        names="value")
 cancel_btn.on_click(on_cancel)
 back_btn.on_click(lambda _: open_step(1))
 confirm_btn.on_click(on_confirm)
@@ -1237,12 +1306,17 @@ STEP_TITLES = [
     "3 · DDL Confirmation",
     "4 · Configure Destination Project",
 ]
-_step1 = widgets.VBox([catalog_dd, catalog_hint, foreign_note, load_schemas_btn,
-                       schema_sel, name_filter_w,
+_step1 = widgets.VBox([catalog_dd, catalog_hint, foreign_note,
+                       schema_filter_w, list_schemas_btn, schema_status,
+                       schema_sel,
+                       widgets.HBox([widgets.Label("", layout=widgets.Layout(width="128px")),
+                                     schema_all_btn, schema_none_btn]),
+                       name_filter_w,
                        widgets.HBox([kind_label, inc_tables_w, inc_views_w]),
                        generate_btn, access_note, source_out])
 _step2 = widgets.VBox([
     access_note,
+    catalog_names_w,
     widgets.HBox([step2_back_btn, continue_btn, cancel_btn, workers_dd]),
     continue_status,
     widgets.HBox([filter_w, filter_btn]),
