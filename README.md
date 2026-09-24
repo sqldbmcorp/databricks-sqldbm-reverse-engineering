@@ -164,14 +164,17 @@ The importer is built to handle schemas with tens of thousands of objects:
 - **Nothing pre-selected above 500 objects**, so a large listing can't accidentally turn
   into tens of thousands of `SHOW CREATE` calls. Generating DDL for more than 1,000 objects
   asks for a second click and shows progress with an estimated time remaining.
-- **Optional parallel, cancellable DDL generation.** By default `SHOW CREATE` runs one
-  object at a time on the notebook's main thread. Setting *Parallel* to 1 / 4 / 8 / 16 runs
-  it on background worker threads instead, which keeps the notebook responsive and enables
-  **Cancel**. Cancel stops queued work and, on serverless / Spark Connect, interrupts
-  in-flight queries. DDL already generated is kept, so *Generate* again resumes. Some
-  compute doesn't allow Spark calls from worker threads; if DDL generation fails, the
-  inline *Failure details* say whether that's the cause. Leave *Parallel* on *Off* in that
-  case.
+- **Parallel, cancellable DDL generation.** By default `SHOW CREATE` runs on 8 background
+  worker threads (*Parallel*: Off / 1 / 4 / 8 / 16; hover the ⓘ for details), so the notebook
+  stays responsive and **Cancel** works. Cancel stops queued work and, on serverless / Spark
+  Connect, interrupts in-flight queries; DDL already generated is kept, so *Generate* again
+  resumes.
+  - **Throttling is retried** with exponential backoff (~1, 2, 4, 8 s + jitter) for rate-limit
+    and service-unavailable errors. Permission errors aren't retried.
+  - **Foreign catalogs use at most 1 worker**, since each statement queries the external
+    database.
+  - If generation fails at every Parallel setting but works with *Off*, the compute doesn't
+    allow Spark calls from background threads. The inline *Failure details* point this out.
 - **Step 3 previews the first 200 objects** and reports the full payload size, raw and
   gzipped, flagging it if it's over the API limit.
 - **Compressed submit.** The payload is sent gzip-compressed. The SqlDBM API accepts up to

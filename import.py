@@ -14,7 +14,7 @@ Requirements: ipywidgets (current DBR / serverless), Unity Catalog read access, 
 HTTPS to api.sqldbm.com. `spark` is taken from the calling notebook's globals.
 """
 
-import os, re, json, time, html, gzip, requests, functools, threading
+import os, re, json, time, html, gzip, random, requests, functools, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import ipywidgets as widgets
@@ -177,7 +177,16 @@ CATALOG_NAME_OPTIONS = [("Discard names on upload", "discard"),
 UNSUPPORTED_KINDS = {"STREAMING TABLE"}   # not yet importable into SqlDBM; excluded
 PREVIEW_OBJECTS = 200          # Step 3 renders DDL for at most this many objects
 DDL_WORKERS = [("Off (main thread, no Cancel)", 0), ("1", 1), ("4", 4), ("8", 8), ("16", 16)]
-DDL_TAG = "sqldbm-ddl-import"  # Spark Connect operation tag, used to interrupt in-flight queries
+DDL_TAG = "sqldbm-ddl-import"
+DEFAULT_WORKERS = 8
+FOREIGN_MAX_WORKERS = 1        # each SHOW CREATE on a foreign catalog opens a query on the source DB
+# Throttling / service-unavailable failures worth retrying (exponential backoff + jitter).
+# Deliberately excludes generic connection timeouts: an unreachable foreign source would retry for
+# minutes per object. Permission and "not found" errors are never retried.
+TRANSIENT_MARKERS = ("REQUEST_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS", "Too Many Requests", "429",
+                     "TEMPORARILY_UNAVAILABLE", "SERVICE_UNAVAILABLE", "503", "RESOURCE_EXHAUSTED",
+                     "StatusCode.UNAVAILABLE")
+DDL_RETRIES = 4                # attempts after the first: ~1s, 2s, 4s, 8s (+ jitter)  # Spark Connect operation tag, used to interrupt in-flight queries
 
 NEW_PROJECT = "➕  Create new project"
 NEW_BRANCH = "➕  Create new branch"
@@ -315,7 +324,7 @@ catalog_names_w  = widgets.RadioButtons(options=CATALOG_NAME_OPTIONS, value="dis
                                         layout=widgets.Layout(width="520px"), style=_S)
 cancel_btn       = widgets.Button(description="Cancel", button_style="danger", icon="stop",
                                   layout=widgets.Layout(width="100px", display="none"))
-workers_dd       = widgets.Dropdown(options=DDL_WORKERS, value=0, description="Parallel",
+workers_dd       = widgets.Dropdown(options=DDL_WORKERS, value=DEFAULT_WORKERS, description="Parallel",
                                     layout=widgets.Layout(width="330px"), style={"description_width": "70px"})
 PARALLEL_HELP = (
     "How many SHOW CREATE TABLE statements run at the same time while generating DDL.\n\n"
@@ -323,10 +332,11 @@ PARALLEL_HELP = (
     "The notebook is busy until it finishes, so Cancel isn't available (interrupt the cell instead).\n\n"
     "1 / 4 / 8 / 16: runs on background worker threads. The notebook stays responsive, shows "
     "progress, and Cancel works (already generated DDL is kept; Generate again resumes). Higher "
-    "values finish large selections faster but put more concurrent load on the metastore.\n\n"
+    "values finish large selections faster but put more concurrent load on the metastore. Throttled "
+    "or temporarily failing statements are retried automatically with backoff.\n\n"
     "If DDL generation fails at every Parallel setting but works with Off, this compute doesn't "
-    "allow Spark calls from background threads, so use Off. For foreign (federated) catalogs, each "
-    "statement queries the external database, so keep this low.")
+    "allow Spark calls from background threads, so use Off. Foreign (federated) catalogs always use "
+    "at most 1 worker, because each statement queries the external database.")
 workers_info     = widgets.HTML(
     f"<span title=\"{html.escape(PARALLEL_HELP)}\" style='cursor:help;color:#1a73e8;font-size:16px;"
     "padding:0 4px' aria-label='About the Parallel setting'>ⓘ</span>")
@@ -519,10 +529,32 @@ def _show_create(r):
     try:
         return spark.sql(f"SHOW CREATE TABLE `{cat}`.`{sch}`.`{name}`").first()[0]
     except Exception as e1:
+        first = _err_line(e1)
+        if _is_transient(first) or _is_permission_error(first):
+            raise RuntimeError(first) from e1   # the unqualified form can't do better; don't double the load
         try:
             return spark.sql(f"SHOW CREATE TABLE `{sch}`.`{name}`").first()[0]
         except Exception as e2:
             raise RuntimeError(f"{_err_line(e1)}  |  unqualified retry: {_err_line(e2)}") from e2
+
+def _is_transient(reason):
+    return any(m in (reason or "") for m in TRANSIENT_MARKERS) and not _is_permission_error(reason)
+
+def _show_create_retrying(r, cancel=None):
+    """_show_create with exponential backoff on throttling / transient errors. Gives up (re-raising
+    the last error) if `cancel` is set while waiting."""
+    for attempt in range(DDL_RETRIES + 1):
+        try:
+            return _show_create(r)
+        except Exception as e:
+            reason = str(e) if isinstance(e, RuntimeError) else _err_line(e)
+            if attempt == DDL_RETRIES or not _is_transient(reason):
+                raise
+            delay = min(2 ** attempt, 16) * (0.75 + random.random() / 2)
+            if cancel is None:
+                time.sleep(delay)
+            elif cancel.wait(delay):
+                raise
 
 def _err_line(e):
     """One-line, type-prefixed summary of an exception (Spark errors can start with blank lines)."""
@@ -781,7 +813,7 @@ def _generate_ddl(to_generate, workers):
         if cancel.is_set():
             return r, None, "cancelled"
         try:
-            return r, _show_create(r), None
+            return r, _show_create_retrying(r, cancel), None
         except Exception as e:
             return r, None, (str(e) if isinstance(e, RuntimeError) else _err_line(e))
 
@@ -841,8 +873,16 @@ def _generate_ddl(to_generate, workers):
 
 _probe_result = {"ok": None, "err": None}
 
+def _effective_workers():
+    """The Parallel setting, capped for foreign catalogs (each statement hits the source database)."""
+    w = workers_dd.value
+    return min(w, FOREIGN_MAX_WORKERS) if w and catalog and _is_foreign(catalog) else w
+
 def _mode(workers):
-    return f"{workers}× parallel" if workers else "main thread"
+    if not workers:
+        return "main thread"
+    capped = workers < workers_dd.value and catalog and _is_foreign(catalog)
+    return f"{workers}× parallel" + (" — capped for a foreign catalog" if capped else "")
 
 _PERMISSION_MARKERS = ("PERMISSION_DENIED", "INSUFFICIENT_PERMISSIONS", "UnauthorizedAccessException")
 
@@ -892,7 +932,7 @@ def _check_read_access(res):
     denied, other = {}, {}
     for schema, r in by_schema.items():
         try:
-            r["ddl"] = _show_create(r)
+            r["ddl"] = _show_create_retrying(r)
             r["kind"] = _kind_from_ddl(r["ddl"]) or r["kind"]
         except Exception as e:
             reason = str(e) if isinstance(e, RuntimeError) else _err_line(e)
@@ -908,9 +948,6 @@ def _check_read_access(res):
                      f"permissions; DDL generation may fail there too.{_technical(list(other.items()))}</div>")
     access_note.value = "".join(notes)
     return denied_schemas
-
-def _mode(workers):
-    return f"{workers}× parallel" if workers else "main thread"
 
 def _failure_details(skipped, workers):
     """Explain DDL failures inline: a friendly box for permission errors, raw errors collapsed."""
@@ -949,7 +986,7 @@ def on_preview_continue(_):
     if len(to_generate) > DDL_CONFIRM_LIMIT and _ddl_confirm["n"] != len(to_generate):
         _ddl_confirm["n"] = len(to_generate)
         continue_status.value = (f"<span style='color:#a60'>⚠ This runs SHOW CREATE for "
-                                 f"<b>{len(to_generate):,}</b> objects ({_mode(workers_dd.value)}) and can "
+                                 f"<b>{len(to_generate):,}</b> objects ({_mode(_effective_workers())}) and can "
                                  "take a while. Click again to proceed (you can cancel), or narrow the "
                                  "selection.</span>")
         return
@@ -957,11 +994,12 @@ def on_preview_continue(_):
     if not to_generate:
         _show_preview()
         return
+    workers = _effective_workers()
     # Run the first object on the main thread: it separates "SHOW CREATE fails here" from
     # "SHOW CREATE fails only on worker threads" when diagnosing failures.
     first = to_generate[0]
     try:
-        first["ddl"] = _show_create(first)
+        first["ddl"] = _show_create_retrying(first)
         first["kind"] = _kind_from_ddl(first["ddl"]) or first["kind"]
         _probe_result.update(ok=True, err=None)
     except Exception as e:
@@ -969,11 +1007,11 @@ def on_preview_continue(_):
     _ddl_run["cancel"].clear()
     _set_running(True)
     continue_status.value = "<span style='color:#555'>⏳ Generating DDL…</span>"
-    if not workers_dd.value:
+    if not workers:
         cancel_btn.layout.display = "none"   # the kernel is busy, so a click couldn't arrive anyway
         _generate_ddl(to_generate, 0)
         return
-    t = threading.Thread(target=_generate_ddl, args=(to_generate, workers_dd.value), daemon=True)
+    t = threading.Thread(target=_generate_ddl, args=(to_generate, workers), daemon=True)
     _ddl_run["thread"] = t
     t.start()
 
