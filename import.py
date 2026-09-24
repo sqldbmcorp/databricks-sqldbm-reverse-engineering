@@ -316,8 +316,20 @@ catalog_names_w  = widgets.RadioButtons(options=CATALOG_NAME_OPTIONS, value="dis
 cancel_btn       = widgets.Button(description="Cancel", button_style="danger", icon="stop",
                                   layout=widgets.Layout(width="100px", display="none"))
 workers_dd       = widgets.Dropdown(options=DDL_WORKERS, value=0, description="Parallel",
-                                    tooltip="How many SHOW CREATE statements run at once",
-                                    layout=widgets.Layout(width="200px"), style=_S)
+                                    layout=widgets.Layout(width="330px"), style={"description_width": "70px"})
+PARALLEL_HELP = (
+    "How many SHOW CREATE TABLE statements run at the same time while generating DDL.\n\n"
+    "Off (main thread): one at a time on the notebook's main thread. Works on any compute. "
+    "The notebook is busy until it finishes, so Cancel isn't available (interrupt the cell instead).\n\n"
+    "1 / 4 / 8 / 16: runs on background worker threads. The notebook stays responsive, shows "
+    "progress, and Cancel works (already generated DDL is kept; Generate again resumes). Higher "
+    "values finish large selections faster but put more concurrent load on the metastore.\n\n"
+    "If DDL generation fails at every Parallel setting but works with Off, this compute doesn't "
+    "allow Spark calls from background threads, so use Off. For foreign (federated) catalogs, each "
+    "statement queries the external database, so keep this low.")
+workers_info     = widgets.HTML(
+    f"<span title=\"{html.escape(PARALLEL_HELP)}\" style='cursor:help;color:#1a73e8;font-size:16px;"
+    "padding:0 4px' aria-label='About the Parallel setting'>ⓘ</span>")
 # ---- Step 3 (DDL confirmation) ----
 preview_out      = widgets.HTML("")
 back_btn         = widgets.Button(description="◂  Back", layout=widgets.Layout(width="100px"))
@@ -1317,7 +1329,8 @@ _step1 = widgets.VBox([catalog_dd, catalog_hint, foreign_note,
 _step2 = widgets.VBox([
     access_note,
     catalog_names_w,
-    widgets.HBox([step2_back_btn, continue_btn, cancel_btn, workers_dd]),
+    widgets.HBox([step2_back_btn, continue_btn, cancel_btn, workers_dd, workers_info],
+                 layout=widgets.Layout(align_items="center")),
     continue_status,
     widgets.HBox([filter_w, filter_btn]),
     widgets.HBox([options_label, select_all_btn, select_none_btn, select_page_btn, objects_summary]),
