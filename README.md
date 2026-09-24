@@ -25,11 +25,14 @@ and renders the widgets inline. Then:
 
 1. Check the **Environment preflight** banner at the top — all four rows should be green
    (Compute is informational). Hover any row label for an explanation.
-2. **Step 1 · Select Catalog and Schema(s)** — pick a catalog (none is pre-selected), then
-   schema(s), optionally a *Name filter* and object types, and click *List Objects*. Catalogs marked **⚠ foreign** are Lakehouse
-   Federation sources — see [Foreign catalogs](#foreign-lakehouse-federation-catalogs).
-3. **Step 2 · Select Objects and Generate DDL** — review the object list; uncheck anything
-   you don't want; click *Generate DDL for Selected*.
+2. **Step 1 · Select Catalog and Schema(s)** — pick a catalog (none is pre-selected),
+   optionally set a *Schema filter*, click *List Schemas*, and select schema(s). Then
+   optionally set a *Name filter* and object types, and click *List Objects*. Catalogs
+   marked **⚠ foreign** are Lakehouse Federation sources — see
+   [Foreign catalogs](#foreign-lakehouse-federation-catalogs).
+3. **Step 2 · Select Objects and Generate DDL** — choose how **Catalog names** are
+   uploaded, review the object list, uncheck anything you don't want, and click *Generate
+   DDL for Selected*.
 4. **Step 3 · DDL Confirmation** — review the DDL, then click *Confirm & Configure
    Destination*.
 5. **Step 4 · Configure Destination Project** — paste your API token, click *Connect &
@@ -72,15 +75,16 @@ where it matters:
 When the bootstrap runs, the notebook renders an **Environment preflight** banner followed
 by a four-step accordion (only one step open at a time):
 
-1. **Select Catalog and Schema(s)** — choose a catalog, select one or more schemas,
-   optionally enter a **Name filter** and choose which object types to include (Tables,
-   Views), and click *List Objects*. No catalog is selected on load, so nothing
-   is queried until you pick one. Foreign catalogs are flagged and never queried
-   automatically.
+1. **Select Catalog and Schema(s)** — choose a catalog, optionally enter a **Schema
+   filter**, and click *List Schemas*; select one or more schemas (*Select all listed*
+   helps), optionally enter a **Name filter** and choose which object types to include
+   (Tables, Views), and click *List Objects*. Nothing is queried until you click a *List*
+   button, and foreign catalogs are flagged.
 2. **Select Objects and Generate DDL** — discovered objects appear as checkboxes, grouped
    by schema and **paginated** (100 / 250 / 500 per page). Filter by name, *Select all
    matching* / *Deselect all matching* / *Select this page*, then click *Generate DDL for
-   Selected* to build the DDL payload.
+   Selected* to build the DDL payload. **Catalog names** mirrors SqlDBM's reverse-engineering
+   option — see [Catalog names](#catalog-names).
 3. **DDL Confirmation** — review the exact DDL that will be sent, then click
    *Confirm & Configure Destination*.
 4. **Configure Destination Project** — enter your SqlDBM API token, click
@@ -141,7 +145,10 @@ Any non-passing check prints a plain-language note explaining how to remediate i
 
 The importer is built to handle schemas with tens of thousands of objects:
 
-- **Filter before you list.** Step 1's *Name filter* is sent to Databricks as
+- **Filter schemas before you list them.** Step 1's *Schema filter* is sent to Databricks as
+  `SHOW SCHEMAS IN <catalog> LIKE '<pattern>'` (one call, instead of `listDatabases()`'s
+  per-schema lookups), so large catalogs list quickly.
+- **Filter objects before you list them.** Step 1's *Name filter* is sent to Databricks as
   `SHOW TABLES … LIKE '<pattern>'`, so only matching names come back. Patterns are
   case-insensitive; `*` matches any characters and `|` separates alternatives — e.g.
   `fact_*|dim_*` or `*_2024*`. *Tables* covers managed and external tables (external tables keep their `LOCATION` in
@@ -157,14 +164,17 @@ The importer is built to handle schemas with tens of thousands of objects:
 - **Nothing pre-selected above 500 objects**, so a large listing can't accidentally turn
   into tens of thousands of `SHOW CREATE` calls. Generating DDL for more than 1,000 objects
   asks for a second click and shows progress with an estimated time remaining.
-- **Optional parallel, cancellable DDL generation.** By default `SHOW CREATE` runs one
-  object at a time on the notebook's main thread. Setting *Parallel* to 1 / 4 / 8 / 16 runs
-  it on background worker threads instead, which keeps the notebook responsive and enables
-  **Cancel**. Cancel stops queued work and, on serverless / Spark Connect, interrupts
-  in-flight queries. DDL already generated is kept, so *Generate* again resumes. Some
-  compute doesn't allow Spark calls from worker threads; if DDL generation fails, the
-  inline *Failure details* say whether that's the cause. Leave *Parallel* on *Off* in that
-  case.
+- **Parallel, cancellable DDL generation.** By default `SHOW CREATE` runs on 8 background
+  worker threads (*Parallel*: Off / 1 / 4 / 8 / 16; hover the ⓘ for details), so the notebook
+  stays responsive and **Cancel** works. Cancel stops queued work and, on serverless / Spark
+  Connect, interrupts in-flight queries; DDL already generated is kept, so *Generate* again
+  resumes.
+  - **Throttling is retried** with exponential backoff (~1, 2, 4, 8 s + jitter) for rate-limit
+    and service-unavailable errors. Permission errors aren't retried.
+  - **Foreign catalogs use at most 1 worker**, since each statement queries the external
+    database.
+  - If generation fails at every Parallel setting but works with *Off*, the compute doesn't
+    allow Spark calls from background threads. The inline *Failure details* point this out.
 - **Step 3 previews the first 200 objects** and reports the full payload size, raw and
   gzipped, flagging it if it's over the API limit.
 - **Compressed submit.** The payload is sent gzip-compressed. The SqlDBM API accepts up to
@@ -172,6 +182,21 @@ The importer is built to handle schemas with tens of thousands of objects:
   the 100 MB uncompressed limit is the one that matters. Oversized payloads are stopped
   before sending. The import is processed before the API responds, so the client waits
   up to 15 minutes.
+
+---
+
+## Catalog names
+
+Step 2 has the same **Catalog names** option as SqlDBM's in-app reverse engineering:
+
+- **Discard names on upload** (default, matching the app's default) — objects are imported
+  as `schema.object`. The SqlDBM API always keeps database names, so the notebook removes the
+  source catalog from 3-part names in the DDL before upload: `CREATE` statements, foreign-key
+  `REFERENCES` and view bodies. String literals and other catalogs' names are left as-is.
+- **Keep names on upload (use fully-qualified names)** — DDL is uploaded as generated
+  (`catalog.schema.object`), and the catalog becomes a database in the SqlDBM model.
+
+Changing the option updates the Step 3 preview immediately; no DDL is regenerated.
 
 ---
 
@@ -186,7 +211,7 @@ reach the database, Step 1 fails with a JDBC error such as
 `SHOW CATALOGS`.
 
 The importer flags these catalogs as **⚠ foreign (federated)** and does not query them
-until you click *Try loading schemas anyway*. To make them work:
+until you click *List Schemas*. To make them work:
 
 1. **Check the connection.** Catalog Explorer → External data → Connections → *your
    connection* → **Test connection**. Verify host, port and credentials (SQL Server's default

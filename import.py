@@ -14,7 +14,7 @@ Requirements: ipywidgets (current DBR / serverless), Unity Catalog read access, 
 HTTPS to api.sqldbm.com. `spark` is taken from the calling notebook's globals.
 """
 
-import os, json, time, html, gzip, requests, functools, threading
+import os, re, json, time, html, gzip, random, requests, functools, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import ipywidgets as widgets
@@ -172,10 +172,21 @@ selected_schemas = []
 PAGE_SIZES = [100, 250, 500]   # checkbox rows rendered per Step 2 page
 AUTO_SELECT_LIMIT = 500        # listings larger than this start with nothing selected
 DDL_CONFIRM_LIMIT = 1000       # generating DDL for more objects than this asks for a second click
+CATALOG_NAME_OPTIONS = [("Discard names on upload", "discard"),
+                        ("Keep names on upload (use fully-qualified names)", "keep")]
 UNSUPPORTED_KINDS = {"STREAMING TABLE"}   # not yet importable into SqlDBM; excluded
 PREVIEW_OBJECTS = 200          # Step 3 renders DDL for at most this many objects
 DDL_WORKERS = [("Off (main thread, no Cancel)", 0), ("1", 1), ("4", 4), ("8", 8), ("16", 16)]
-DDL_TAG = "sqldbm-ddl-import"  # Spark Connect operation tag, used to interrupt in-flight queries
+DDL_TAG = "sqldbm-ddl-import"
+DEFAULT_WORKERS = 8
+FOREIGN_MAX_WORKERS = 1        # each SHOW CREATE on a foreign catalog opens a query on the source DB
+# Throttling / service-unavailable failures worth retrying (exponential backoff + jitter).
+# Deliberately excludes generic connection timeouts: an unreachable foreign source would retry for
+# minutes per object. Permission and "not found" errors are never retried.
+TRANSIENT_MARKERS = ("REQUEST_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS", "Too Many Requests", "429",
+                     "TEMPORARILY_UNAVAILABLE", "SERVICE_UNAVAILABLE", "503", "RESOURCE_EXHAUSTED",
+                     "StatusCode.UNAVAILABLE")
+DDL_RETRIES = 4                # attempts after the first: ~1s, 2s, 4s, 8s (+ jitter)  # Spark Connect operation tag, used to interrupt in-flight queries
 
 NEW_PROJECT = "➕  Create new project"
 NEW_BRANCH = "➕  Create new branch"
@@ -238,17 +249,38 @@ def _short_err(e):
     """First meaningful part of a Spark/JDBC error — drop the JVM stacktrace."""
     return str(e).split("JVM stacktrace")[0].strip()
 
-def _list_schemas(cat):
-    # Mirrors the tool's DatabricksGetStructure: set current catalog, then listDatabases().
-    spark.catalog.setCurrentCatalog(cat)
-    return sorted(d.name for d in spark.catalog.listDatabases())
+def _list_schemas(cat, pattern=""):
+    """Schema names via one SHOW SCHEMAS call, with the filter applied by the server.
+    spark.catalog.listDatabases() loads metadata per schema, which is slow on large catalogs;
+    it's the fallback (filtered client-side) if SHOW SCHEMAS is unsupported."""
+    try:
+        rows = spark.sql(f"SHOW SCHEMAS IN `{cat}`{_like(pattern)}").collect()
+        return sorted(r[0] for r in rows)
+    except Exception:
+        spark.catalog.setCurrentCatalog(cat)
+        names = sorted(d.name for d in spark.catalog.listDatabases())
+        return [n for n in names if _like_match(pattern, n)]
+
+def _like_match(pattern, name):
+    """Client-side twin of Databricks' SHOW … LIKE: * = any chars, | = alternatives, case-insensitive."""
+    pattern = (pattern or "").strip()
+    if not pattern:
+        return True
+    return any(re.fullmatch(".*".join(map(re.escape, alt.strip().split("*"))), name, re.I)
+               for alt in pattern.split("|"))
 
 catalog_dd   = widgets.Dropdown(description="Catalog", options=[],
                                 layout=widgets.Layout(**_W), style=_S)
 catalog_hint = widgets.HTML("")
 foreign_note = widgets.HTML("")
-load_schemas_btn = widgets.Button(description="Try loading schemas anyway", button_style="warning",
-                                  layout=widgets.Layout(width="240px", margin="4px 130px", display="none"))
+schema_filter_w = widgets.Text(description="Schema filter",
+                               placeholder="optional — e.g. sales*|finance_*   (* = any, | = or)",
+                               continuous_update=False, layout=widgets.Layout(**_W), style=_S)
+list_schemas_btn = widgets.Button(description="List Schemas", button_style="primary", disabled=True,
+                                  layout=widgets.Layout(width="220px", margin="4px 130px"))
+schema_status = widgets.HTML("")
+schema_all_btn = widgets.Button(description="Select all listed", layout=widgets.Layout(width="150px"))
+schema_none_btn = widgets.Button(description="Clear", layout=widgets.Layout(width="80px"))
 _catalog_meta = {}      # catalog -> {"type", "connection"} (filled at init)
 schema_sel   = widgets.SelectMultiple(description="Schema(s)", options=[], rows=8,
                                       layout=widgets.Layout(**_W), style=_S)
@@ -287,11 +319,27 @@ step2_back_btn   = widgets.Button(description="◂  Back", layout=widgets.Layout
 continue_btn     = widgets.Button(description="Generate DDL for Selected ▸", button_style="primary",
                                   layout=widgets.Layout(width="260px"))
 continue_status  = widgets.HTML("")
+catalog_names_w  = widgets.RadioButtons(options=CATALOG_NAME_OPTIONS, value="discard",
+                                        description="Catalog names",
+                                        layout=widgets.Layout(width="520px"), style=_S)
 cancel_btn       = widgets.Button(description="Cancel", button_style="danger", icon="stop",
                                   layout=widgets.Layout(width="100px", display="none"))
-workers_dd       = widgets.Dropdown(options=DDL_WORKERS, value=0, description="Parallel",
-                                    tooltip="How many SHOW CREATE statements run at once",
-                                    layout=widgets.Layout(width="200px"), style=_S)
+workers_dd       = widgets.Dropdown(options=DDL_WORKERS, value=DEFAULT_WORKERS, description="Parallel",
+                                    layout=widgets.Layout(width="330px"), style={"description_width": "70px"})
+PARALLEL_HELP = (
+    "How many SHOW CREATE TABLE statements run at the same time while generating DDL.\n\n"
+    "Off (main thread): one at a time on the notebook's main thread. Works on any compute. "
+    "The notebook is busy until it finishes, so Cancel isn't available (interrupt the cell instead).\n\n"
+    "1 / 4 / 8 / 16: runs on background worker threads. The notebook stays responsive, shows "
+    "progress, and Cancel works (already generated DDL is kept; Generate again resumes). Higher "
+    "values finish large selections faster but put more concurrent load on the metastore. Throttled "
+    "or temporarily failing statements are retried automatically with backoff.\n\n"
+    "If DDL generation fails at every Parallel setting but works with Off, this compute doesn't "
+    "allow Spark calls from background threads, so use Off. Foreign (federated) catalogs always use "
+    "at most 1 worker, because each statement queries the external database.")
+workers_info     = widgets.HTML(
+    f"<span title=\"{html.escape(PARALLEL_HELP)}\" style='cursor:help;color:#1a73e8;font-size:16px;"
+    "padding:0 4px' aria-label='About the Parallel setting'>ⓘ</span>")
 # ---- Step 3 (DDL confirmation) ----
 preview_out      = widgets.HTML("")
 back_btn         = widgets.Button(description="◂  Back", layout=widgets.Layout(width="100px"))
@@ -326,8 +374,7 @@ def _foreign_help_html(cat, expanded=False):
         f"{' — ' + conn_desc if conn_desc else ''}). "
         "Its schemas and tables are not stored in Unity Catalog; listing them, listing tables and "
         "SHOW CREATE TABLE are sent <i>live</i> to the external database from the compute running this "
-        "notebook. Schemas were not loaded automatically because that call can hang or fail if the "
-        "source is unreachable."
+        "notebook, so <i>List Schemas</i> can hang or fail if the source is unreachable."
         f"<details{' open' if expanded else ''} style='margin-top:6px'>"
         "<summary style='cursor:pointer;font-weight:600'>How to reverse-engineer from a foreign catalog</summary>"
         "<ol style='margin:6px 0 0 18px;padding:0'>"
@@ -346,43 +393,57 @@ def _foreign_help_html(cat, expanded=False):
         "<li><b>Confirm permissions:</b> <code>USE CATALOG</code> on the catalog, <code>USE SCHEMA</code> "
         "and <code>SELECT</code> on the schemas you want to import.</li>"
         f"<li><b>Test from a cell:</b> <code>SHOW SCHEMAS IN `{esc(cat)}`</code>. Once that returns, "
-        "click <i>Try loading schemas anyway</i> below.</li>"
+        "click <i>List Schemas</i> below.</li>"
         "<li><b>Or skip Databricks entirely:</b> DDL read through a foreign catalog uses Databricks' "
         "mapped types, not the source's native DDL. For a native model, create a SqlDBM project with the "
         "source database type (e.g. SQL Server) and reverse-engineer from that database directly.</li>"
         "</ol></details></div>")
 
-def _load_schemas(cat):
-    schema_sel.options = ["⏳ Loading schemas…"]
-    schema_sel.disabled = True
+def _hint(text, color="#666"):
+    return f"<div style='margin:0 0 4px 128px;font-size:12px;color:{color}'>{text}</div>"
+
+def on_list_schemas(_=None):
+    cat = catalog_dd.value
+    if not cat:
+        return
+    source_out.clear_output()
+    access_note.value = ""
+    schema_sel.options = []
+    pattern = schema_filter_w.value
+    list_schemas_btn.disabled = True
+    list_schemas_btn.description = "Listing schemas…"
+    schema_status.value = _hint("⏳ Listing schemas…", "#555")
+    t0 = time.time()
     try:
-        schema_sel.options = _list_schemas(cat)
-        load_schemas_btn.layout.display = "none"
+        names = _list_schemas(cat, pattern)
+        schema_sel.options = names
+        filt = f" matching <code>{html.escape(pattern.strip())}</code>" if pattern.strip() else ""
+        schema_status.value = _hint(
+            f"{len(names):,} schema(s){filt} in {time.time() - t0:.1f}s. Select one or more below."
+            if names else f"No schemas{filt}. Adjust the Schema filter and list again.",
+            "#666" if names else "#a60")
     except Exception as e:
-        schema_sel.options = []
+        schema_status.value = ""
         if _is_foreign(cat):
             foreign_note.value = _foreign_help_html(cat, expanded=True)
         with source_out:
             print(f"Could not list schemas for '{cat}': {_short_err(e)}")
     finally:
-        schema_sel.disabled = False
+        list_schemas_btn.disabled = False
+        list_schemas_btn.description = "List Schemas"
 
 def on_catalog_change(_=None):
+    """Picking a catalog only resets Step 1 — schemas load when the user clicks List Schemas, so a
+    large (or unreachable, federated) catalog is never enumerated without a chance to filter first."""
     source_out.clear_output()
     access_note.value = ""
     foreign_note.value = ""
-    load_schemas_btn.layout.display = "none"
     schema_sel.options = []
+    schema_status.value = ""
     cat = catalog_dd.value
-    if not cat:
-        return
-    if _is_foreign(cat):
-        # Don't auto-query a federated source: show the guidance and let the user opt in.
+    list_schemas_btn.disabled = not cat
+    if cat and _is_foreign(cat):
         foreign_note.value = _foreign_help_html(cat)
-        load_schemas_btn.description = "Try loading schemas anyway"
-        load_schemas_btn.layout.display = ""
-        return
-    _load_schemas(cat)
 
 def _kind_from_tabletype(table_type):
     tt = (table_type or "").upper()
@@ -468,10 +529,32 @@ def _show_create(r):
     try:
         return spark.sql(f"SHOW CREATE TABLE `{cat}`.`{sch}`.`{name}`").first()[0]
     except Exception as e1:
+        first = _err_line(e1)
+        if _is_transient(first) or _is_permission_error(first):
+            raise RuntimeError(first) from e1   # the unqualified form can't do better; don't double the load
         try:
             return spark.sql(f"SHOW CREATE TABLE `{sch}`.`{name}`").first()[0]
         except Exception as e2:
             raise RuntimeError(f"{_err_line(e1)}  |  unqualified retry: {_err_line(e2)}") from e2
+
+def _is_transient(reason):
+    return any(m in (reason or "") for m in TRANSIENT_MARKERS) and not _is_permission_error(reason)
+
+def _show_create_retrying(r, cancel=None):
+    """_show_create with exponential backoff on throttling / transient errors. Gives up (re-raising
+    the last error) if `cancel` is set while waiting."""
+    for attempt in range(DDL_RETRIES + 1):
+        try:
+            return _show_create(r)
+        except Exception as e:
+            reason = str(e) if isinstance(e, RuntimeError) else _err_line(e)
+            if attempt == DDL_RETRIES or not _is_transient(reason):
+                raise
+            delay = min(2 ** attempt, 16) * (0.75 + random.random() / 2)
+            if cancel is None:
+                time.sleep(delay)
+            elif cancel.wait(delay):
+                raise
 
 def _err_line(e):
     """One-line, type-prefixed summary of an exception (Spark errors can start with blank lines)."""
@@ -569,9 +652,34 @@ def current_matches():
 def selected_count():
     return sum(1 for v in selected.values() if v)
 
+# SqlDBM's reverse-engineering "Catalog names" option. The OpenAPI always keeps database names
+# (DdlImportService.ParseDatabases = true), so "discard" is applied here by stripping the source
+# catalog from 3-part names before upload — the same result as the app's DatabaseInfoCleaner.
+_IDENT = r"(?:`(?:[^`]|``)+`|[A-Za-z_][\w$]*)"
+_STRING_LITERAL = re.compile(r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")""")
+
+def _discard_catalog(ddl, cat):
+    """`cat`.`schema`.`obj` -> `schema`.`obj` everywhere in the DDL (CREATE names, REFERENCES, view
+    bodies), leaving string literals and other catalogs' names untouched."""
+    names = {cat} | ({"hive_metastore", "spark_catalog"} if cat.lower() in ("hive_metastore", "spark_catalog") else set())
+    alts = []
+    for n in names:
+        alts.append("`" + re.escape(n.replace("`", "``")) + "`")
+        if re.fullmatch(r"[A-Za-z_][\w$]*", n):
+            alts.append(re.escape(n))
+    pat = re.compile(r"(?<![\w`.$])(?:" + "|".join(alts) + r")\s*\.\s*(?=" + _IDENT + r"\s*\.\s*" + _IDENT + ")",
+                     re.IGNORECASE)
+    parts = _STRING_LITERAL.split(ddl)
+    return "".join(p if i % 2 else pat.sub("", p) for i, p in enumerate(parts))
+
+def _ddl_for_upload(r):
+    keep = catalog_names_w.value == "keep"
+    header = f"-- {r['catalog']}.{r['schema']}.{r['name']}" if keep else f"-- {r['schema']}.{r['name']}"
+    ddl = r["ddl"] if keep else _discard_catalog(r["ddl"], r["catalog"])
+    return f"{header}\n{ddl};\n"
+
 def build_payload():
-    return "\n".join(f"-- {r['catalog']}.{r['schema']}.{r['name']}\n{r['ddl']};\n"
-                     for r in results if selected.get(_key(r), False) and r.get("ddl"))
+    return "\n".join(_ddl_for_upload(r) for r in results if selected.get(_key(r), False) and r.get("ddl"))
 
 def on_toggle(change, key):
     selected[key] = change["new"]
@@ -705,7 +813,7 @@ def _generate_ddl(to_generate, workers):
         if cancel.is_set():
             return r, None, "cancelled"
         try:
-            return r, _show_create(r), None
+            return r, _show_create_retrying(r, cancel), None
         except Exception as e:
             return r, None, (str(e) if isinstance(e, RuntimeError) else _err_line(e))
 
@@ -765,8 +873,16 @@ def _generate_ddl(to_generate, workers):
 
 _probe_result = {"ok": None, "err": None}
 
+def _effective_workers():
+    """The Parallel setting, capped for foreign catalogs (each statement hits the source database)."""
+    w = workers_dd.value
+    return min(w, FOREIGN_MAX_WORKERS) if w and catalog and _is_foreign(catalog) else w
+
 def _mode(workers):
-    return f"{workers}× parallel" if workers else "main thread"
+    if not workers:
+        return "main thread"
+    capped = workers < workers_dd.value and catalog and _is_foreign(catalog)
+    return f"{workers}× parallel" + (" — capped for a foreign catalog" if capped else "")
 
 _PERMISSION_MARKERS = ("PERMISSION_DENIED", "INSUFFICIENT_PERMISSIONS", "UnauthorizedAccessException")
 
@@ -816,7 +932,7 @@ def _check_read_access(res):
     denied, other = {}, {}
     for schema, r in by_schema.items():
         try:
-            r["ddl"] = _show_create(r)
+            r["ddl"] = _show_create_retrying(r)
             r["kind"] = _kind_from_ddl(r["ddl"]) or r["kind"]
         except Exception as e:
             reason = str(e) if isinstance(e, RuntimeError) else _err_line(e)
@@ -832,9 +948,6 @@ def _check_read_access(res):
                      f"permissions; DDL generation may fail there too.{_technical(list(other.items()))}</div>")
     access_note.value = "".join(notes)
     return denied_schemas
-
-def _mode(workers):
-    return f"{workers}× parallel" if workers else "main thread"
 
 def _failure_details(skipped, workers):
     """Explain DDL failures inline: a friendly box for permission errors, raw errors collapsed."""
@@ -873,7 +986,7 @@ def on_preview_continue(_):
     if len(to_generate) > DDL_CONFIRM_LIMIT and _ddl_confirm["n"] != len(to_generate):
         _ddl_confirm["n"] = len(to_generate)
         continue_status.value = (f"<span style='color:#a60'>⚠ This runs SHOW CREATE for "
-                                 f"<b>{len(to_generate):,}</b> objects ({_mode(workers_dd.value)}) and can "
+                                 f"<b>{len(to_generate):,}</b> objects ({_mode(_effective_workers())}) and can "
                                  "take a while. Click again to proceed (you can cancel), or narrow the "
                                  "selection.</span>")
         return
@@ -881,11 +994,12 @@ def on_preview_continue(_):
     if not to_generate:
         _show_preview()
         return
+    workers = _effective_workers()
     # Run the first object on the main thread: it separates "SHOW CREATE fails here" from
     # "SHOW CREATE fails only on worker threads" when diagnosing failures.
     first = to_generate[0]
     try:
-        first["ddl"] = _show_create(first)
+        first["ddl"] = _show_create_retrying(first)
         first["kind"] = _kind_from_ddl(first["ddl"]) or first["kind"]
         _probe_result.update(ok=True, err=None)
     except Exception as e:
@@ -893,15 +1007,15 @@ def on_preview_continue(_):
     _ddl_run["cancel"].clear()
     _set_running(True)
     continue_status.value = "<span style='color:#555'>⏳ Generating DDL…</span>"
-    if not workers_dd.value:
+    if not workers:
         cancel_btn.layout.display = "none"   # the kernel is busy, so a click couldn't arrive anyway
         _generate_ddl(to_generate, 0)
         return
-    t = threading.Thread(target=_generate_ddl, args=(to_generate, workers_dd.value), daemon=True)
+    t = threading.Thread(target=_generate_ddl, args=(to_generate, workers), daemon=True)
     _ddl_run["thread"] = t
     t.start()
 
-def _show_preview():
+def _show_preview(open_panel=True):
     payload = build_payload()
     if not payload:
         preview_out.value = ("<div style='color:#c00'>No DDL was successfully generated for the "
@@ -910,7 +1024,7 @@ def _show_preview():
     chosen = [r for r in results if selected.get(_key(r), False) and r.get("ddl")]
     n = len(chosen)
     shown = chosen[:PREVIEW_OBJECTS]
-    preview = "\n".join(f"-- {r['catalog']}.{r['schema']}.{r['name']}\n{r['ddl']};\n" for r in shown)
+    preview = "\n".join(_ddl_for_upload(r) for r in shown)
     raw_n = len(payload.encode())
     wire_n = len(gzip.compress(payload.encode(), compresslevel=6))
     more = (f" Showing the first {len(shown):,}; all {n:,} will be submitted." if n > len(shown) else "")
@@ -926,7 +1040,8 @@ def _show_preview():
         "<div style='max-height:480px;overflow:auto;border:1px solid #ccc;padding:8px;"
         "font-family:monospace;white-space:pre;font-size:12px'>"
         f"{html.escape(preview)}</div>")
-    open_step(2)
+    if open_panel:
+        open_step(2)
 
 def on_confirm(_):
     """Step 3 -> Step 4: open the destination panel."""
@@ -1192,7 +1307,9 @@ def _show_links(seg, project_id, branch_id=None, branch_name=None):
 
 # ============================================================ wire up
 catalog_dd.observe(on_catalog_change, names="value")
-load_schemas_btn.on_click(lambda _: _load_schemas(catalog_dd.value) if catalog_dd.value else None)
+list_schemas_btn.on_click(on_list_schemas)
+schema_all_btn.on_click(lambda _: setattr(schema_sel, "value", tuple(schema_sel.options)))
+schema_none_btn.on_click(lambda _: setattr(schema_sel, "value", ()))
 generate_btn.on_click(on_list_objects)
 filter_w.observe(lambda _: go_page(reset=True), names="value")
 filter_btn.on_click(lambda _: go_page(reset=True))
@@ -1204,6 +1321,8 @@ select_all_btn.on_click(lambda b: set_all_filtered(True))
 select_none_btn.on_click(lambda b: set_all_filtered(False))
 step2_back_btn.on_click(lambda _: open_step(0))
 continue_btn.on_click(on_preview_continue)
+catalog_names_w.observe(lambda _: _show_preview(open_panel=False) if preview_out.value else None,
+                        names="value")
 cancel_btn.on_click(on_cancel)
 back_btn.on_click(lambda _: open_step(1))
 confirm_btn.on_click(on_confirm)
@@ -1237,13 +1356,19 @@ STEP_TITLES = [
     "3 · DDL Confirmation",
     "4 · Configure Destination Project",
 ]
-_step1 = widgets.VBox([catalog_dd, catalog_hint, foreign_note, load_schemas_btn,
-                       schema_sel, name_filter_w,
+_step1 = widgets.VBox([catalog_dd, catalog_hint, foreign_note,
+                       schema_filter_w, list_schemas_btn, schema_status,
+                       schema_sel,
+                       widgets.HBox([widgets.Label("", layout=widgets.Layout(width="128px")),
+                                     schema_all_btn, schema_none_btn]),
+                       name_filter_w,
                        widgets.HBox([kind_label, inc_tables_w, inc_views_w]),
                        generate_btn, access_note, source_out])
 _step2 = widgets.VBox([
     access_note,
-    widgets.HBox([step2_back_btn, continue_btn, cancel_btn, workers_dd]),
+    catalog_names_w,
+    widgets.HBox([step2_back_btn, continue_btn, cancel_btn, workers_dd, workers_info],
+                 layout=widgets.Layout(align_items="center")),
     continue_status,
     widgets.HBox([filter_w, filter_btn]),
     widgets.HBox([options_label, select_all_btn, select_none_btn, select_page_btn, objects_summary]),
